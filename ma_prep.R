@@ -30,6 +30,17 @@ OUTPUT_ROOT <- paste0(
   "TRY_meta_analysis"
 )
 
+# Spatial reference used to assign observations of species that occur in more
+# than one PFT. The table must contain final_pft plus latitude/longitude columns
+# (accepted names include lat/lon, latitude/longitude, or Latitude/Longitude).
+PFT_COORDINATE_MAP_FILE <- paste0(
+  "/projectnb/dietzelab/guYANG/",
+  "SIPNET_Model_Calibration/Final_PFT_assignment_v4/",
+  "final_8000_sites_with_final_pft_v4.csv"
+)
+
+PFT_MAX_DISTANCE_KM <- 250
+
 MA_ITERATIONS <- 3000L
 MA_WORKERS <- 2L
 
@@ -38,7 +49,7 @@ MA_WORKERS <- 2L
 # 1. 基础检查和辅助函数
 # ============================================================
 
-MA_PREP_VERSION <- "MA_PREP_RSTUDIO_V1_2026-09-01"
+MA_PREP_VERSION <- "MA_PREP_RSTUDIO_V2_2026-09-02"
 
 load_rdata_object <- function(path, object_name) {
   if (!file.exists(path)) {
@@ -98,12 +109,29 @@ ma_workers <- check_positive_integer(
   "MA_WORKERS"
 )
 
+pft_max_distance_km <- suppressWarnings(as.numeric(PFT_MAX_DISTANCE_KM))
+if (
+  length(pft_max_distance_km) != 1L ||
+  !is.finite(pft_max_distance_km) ||
+  pft_max_distance_km <= 0
+) {
+  stop("PFT_MAX_DISTANCE_KM 必须是正的有限数值。", call. = FALSE)
+}
+
 if (!dir.exists(CODE_DIR)) {
   stop("CODE_DIR 不存在：", CODE_DIR, call. = FALSE)
 }
 
 if (!dir.exists(DATA_ROOT)) {
   stop("DATA_ROOT 不存在：", DATA_ROOT, call. = FALSE)
+}
+
+if (!file.exists(PFT_COORDINATE_MAP_FILE)) {
+  stop(
+    "PFT_COORDINATE_MAP_FILE 不存在：",
+    PFT_COORDINATE_MAP_FILE,
+    call. = FALSE
+  )
 }
 
 code_dir <- normalizePath(CODE_DIR, mustWork = TRUE)
@@ -197,6 +225,15 @@ pftspecies <- load_rdata_object(
   "pftspecies"
 )
 
+pft_coordinate_map <- data.table::fread(
+  PFT_COORDINATE_MAP_FILE,
+  showProgress = FALSE
+)
+
+if (nrow(pft_coordinate_map) == 0L) {
+  stop("PFT_COORDINATE_MAP_FILE 没有数据行。", call. = FALSE)
+}
+
 pft_name_column <- intersect(
   c(
     "final_pft",
@@ -240,6 +277,8 @@ message("PFT: ", pftname)
 message("CODE_DIR: ", code_dir)
 message("DATA_ROOT: ", data_root)
 message("OUTPUT_ROOT: ", output_root)
+message("PFT coordinate map: ", PFT_COORDINATE_MAP_FILE)
+message("PFT maximum assignment distance: ", pft_max_distance_km, " km")
 message("MA iterations: ", ma_iterations)
 message("MA workers: ", ma_workers)
 message("Bridge and SIPNET writer are disabled in this script.")
@@ -310,9 +349,13 @@ try_data <- prepare_single_pft_try_data_for_ma(
   trait_map = trait_map,
   unit_map = unit_map,
   pft_species_map = pftspecies,
+  pft_coordinate_map = pft_coordinate_map,
   
   unit_col = "UnitName",
   value_col = "StdValue",
+  observation_lat_col = "Latitude",
+  observation_lon_col = "Longitude",
+  max_pft_distance_km = pft_max_distance_km,
   
   drop_errorrisk = TRUE,
   unsupported_action = "stop",
@@ -320,6 +363,25 @@ try_data <- prepare_single_pft_try_data_for_ma(
 )
 
 setDT(try_data)
+
+observation_pft_assignment_audit <- attr(
+  try_data,
+  "observation_pft_assignment_audit"
+)
+observation_pft_unassigned <- attr(
+  try_data,
+  "observation_pft_unassigned"
+)
+
+data.table::fwrite(
+  observation_pft_assignment_audit,
+  file.path(prep_dir, "observation_pft_assignment_audit.csv")
+)
+
+data.table::fwrite(
+  observation_pft_unassigned,
+  file.path(prep_dir, "observation_pft_unassigned.csv")
+)
 
 
 # ============================================================
@@ -624,8 +686,24 @@ prior.distns <-
     max_sample_n = 2L,
     width_multiplier = 10,
     relative_sd_floor = 0.10,
-    seed = 20260827L
+    seed = 20260827L,
+    unit_map = unit_map,
+    positive_distribution = "lnorm",
+    domain_action = "stop"
   )
+
+prior_registry <- attr(prior.distns, "prior_registry")
+prior_parameter_audit <- attr(prior.distns, "prior_parameter_audit")
+
+data.table::fwrite(
+  prior_registry,
+  file.path(prep_dir, "prior_distribution_registry.csv")
+)
+
+data.table::fwrite(
+  prior_parameter_audit,
+  file.path(prep_dir, "prior_parameter_audit.csv")
+)
 
 save(
   prior.distns,

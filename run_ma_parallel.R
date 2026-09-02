@@ -382,9 +382,9 @@ run_pecan_ma_parallel <- function(
 #   make_trait_data_from_try_ma_long()
 #   make_prior_distns_from_trait_data()
 #
-# If the three data arguments are NULL, the function uses the objects already
+# If the four data arguments are NULL, the function uses the objects already
 # present in the calling environment:
-#   trydat_use_species, trait_map, pftspecies
+#   trydat_use_species, trait_map, pftspecies, pft_coordinate_map
 run_single_pft_try_ma_pipeline_parallel <- function(
     pftname,
     out_dir,
@@ -402,14 +402,20 @@ run_single_pft_try_ma_pipeline_parallel <- function(
     seed = 20260827L,
     unit_col = "UnitName",
     value_col = "StdValue",
+    observation_lat_col = "Latitude",
+    observation_lon_col = "Longitude",
+    max_pft_distance_km = 250,
     drop_errorrisk = TRUE,
     unsupported_action = "stop",
     ambiguous_species_action = "warn",
+    positive_prior_distribution = "lnorm",
+    prior_domain_action = "stop",
     resume = TRUE,
     save_intermediate = TRUE,
     trydat_use_species = NULL,
     trait_map = NULL,
     pft_species_map = NULL,
+    pft_coordinate_map = NULL,
     unit_map = NULL
 ) {
   caller_env <- parent.frame()
@@ -462,6 +468,10 @@ run_single_pft_try_ma_pipeline_parallel <- function(
   )
   trait_map <- get_existing_object(trait_map, "trait_map")
   pft_species_map <- get_existing_object(pft_species_map, "pftspecies")
+  pft_coordinate_map <- get_existing_object(
+    pft_coordinate_map,
+    "pft_coordinate_map"
+  )
   
   build_unit_map_fn <- get_existing_function("build_try_unit_map")
   validate_units_fn <- get_existing_function(
@@ -516,8 +526,12 @@ run_single_pft_try_ma_pipeline_parallel <- function(
     trait_map = trait_map,
     unit_map = unit_map,
     pft_species_map = pft_species_map,
+    pft_coordinate_map = pft_coordinate_map,
     unit_col = unit_col,
     value_col = value_col,
+    observation_lat_col = observation_lat_col,
+    observation_lon_col = observation_lon_col,
+    max_pft_distance_km = max_pft_distance_km,
     drop_errorrisk = drop_errorrisk,
     unsupported_action = unsupported_action,
     ambiguous_species_action = ambiguous_species_action
@@ -572,7 +586,10 @@ run_single_pft_try_ma_pipeline_parallel <- function(
     max_sample_n = max_sample_n,
     width_multiplier = width_multiplier,
     relative_sd_floor = relative_sd_floor,
-    seed = seed
+    seed = seed,
+    unit_map = unit_map,
+    positive_distribution = positive_prior_distribution,
+    domain_action = prior_domain_action
   )
   
   if (isTRUE(save_intermediate)) {
@@ -588,6 +605,14 @@ run_single_pft_try_ma_pipeline_parallel <- function(
       file.path(prep_dir, "try_data.rds"),
       compress = FALSE
     )
+    data.table::fwrite(
+      attr(try_data, "observation_pft_assignment_audit"),
+      file.path(prep_dir, "observation_pft_assignment_audit.csv")
+    )
+    data.table::fwrite(
+      attr(try_data, "observation_pft_unassigned"),
+      file.path(prep_dir, "observation_pft_unassigned.csv")
+    )
     saveRDS(
       try_ma_long,
       file.path(prep_dir, "try_ma_long.rds"),
@@ -602,6 +627,14 @@ run_single_pft_try_ma_pipeline_parallel <- function(
       prior.distns,
       file = file.path(prep_dir, "prior.distns.Rdata"),
       compress = FALSE
+    )
+    data.table::fwrite(
+      attr(prior.distns, "prior_registry"),
+      file.path(prep_dir, "prior_distribution_registry.csv")
+    )
+    data.table::fwrite(
+      attr(prior.distns, "prior_parameter_audit"),
+      file.path(prep_dir, "prior_parameter_audit.csv")
     )
     
     pipeline_configuration <- list(
@@ -621,9 +654,14 @@ run_single_pft_try_ma_pipeline_parallel <- function(
       seed = seed,
       unit_col = unit_col,
       value_col = value_col,
+      observation_lat_col = observation_lat_col,
+      observation_lon_col = observation_lon_col,
+      max_pft_distance_km = max_pft_distance_km,
       drop_errorrisk = drop_errorrisk,
       unsupported_action = unsupported_action,
-      ambiguous_species_action = ambiguous_species_action
+      ambiguous_species_action = ambiguous_species_action,
+      positive_prior_distribution = positive_prior_distribution,
+      prior_domain_action = prior_domain_action
     )
     saveRDS(
       pipeline_configuration,
