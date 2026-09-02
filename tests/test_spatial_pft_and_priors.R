@@ -105,7 +105,9 @@ stopifnot(
   prior_test["signed_trait", "distn"] == "norm",
   prior_test["percent_trait", "parama"] == 0,
   prior_test["percent_trait", "paramb"] == 100,
-  all(prior_test$parama > 0 | rownames(prior_test) == "signed_trait"),
+  prior_test["fraction_trait", "parama"] > 0,
+  prior_test["fraction_trait", "paramb"] > 0,
+  is.finite(prior_test["positive_trait", "parama"]),
   all(prior_test$paramb > 0)
 )
 
