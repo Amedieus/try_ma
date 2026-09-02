@@ -13,7 +13,7 @@ options(stringsAsFactors = FALSE)
 # 不运行 bridge，也不运行 SIPNET writer。
 # ============================================================
 
-PFT_NAME <- "Permanent_Wetlands"
+PFT_NAME <- "Evergreen_Broadleaf_Forest"
 
 CODE_DIR <- paste0(
   "/projectnb/dietzelab/guYANG/",
