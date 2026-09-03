@@ -382,9 +382,12 @@ run_pecan_ma_parallel <- function(
 #   make_trait_data_from_try_ma_long()
 #   make_prior_distns_from_trait_data()
 #
-# If the four data arguments are NULL, the function uses the objects already
+# If the core data arguments are NULL, the function uses the objects already
 # present in the calling environment:
 #   trydat_use_species, trait_map, pftspecies, pft_coordinate_map
+# observation_coordinate_data is optional when TRY already has coordinates;
+# otherwise pass na_species_res$observation_coordinates or create an object
+# named try_observation_coordinates in the calling environment.
 run_single_pft_try_ma_pipeline_parallel <- function(
     pftname,
     out_dir,
@@ -416,6 +419,7 @@ run_single_pft_try_ma_pipeline_parallel <- function(
     trait_map = NULL,
     pft_species_map = NULL,
     pft_coordinate_map = NULL,
+    observation_coordinate_data = NULL,
     unit_map = NULL
 ) {
   caller_env <- parent.frame()
@@ -472,6 +476,35 @@ run_single_pft_try_ma_pipeline_parallel <- function(
     pft_coordinate_map,
     "pft_coordinate_map"
   )
+  if (is.null(observation_coordinate_data)) {
+    if (exists(
+      "try_observation_coordinates",
+      envir = caller_env,
+      inherits = TRUE
+    )) {
+      observation_coordinate_data <- get(
+        "try_observation_coordinates",
+        envir = caller_env,
+        inherits = TRUE
+      )
+    } else if (
+      exists("na_species_res", envir = caller_env, inherits = TRUE) &&
+      is.list(get("na_species_res", envir = caller_env, inherits = TRUE)) &&
+      !is.null(
+        get(
+          "na_species_res",
+          envir = caller_env,
+          inherits = TRUE
+        )$observation_coordinates
+      )
+    ) {
+      observation_coordinate_data <- get(
+        "na_species_res",
+        envir = caller_env,
+        inherits = TRUE
+      )$observation_coordinates
+    }
+  }
   
   build_unit_map_fn <- get_existing_function("build_try_unit_map")
   validate_units_fn <- get_existing_function(
@@ -527,6 +560,7 @@ run_single_pft_try_ma_pipeline_parallel <- function(
     unit_map = unit_map,
     pft_species_map = pft_species_map,
     pft_coordinate_map = pft_coordinate_map,
+    observation_coordinate_data = observation_coordinate_data,
     unit_col = unit_col,
     value_col = value_col,
     observation_lat_col = observation_lat_col,
@@ -604,6 +638,10 @@ run_single_pft_try_ma_pipeline_parallel <- function(
       try_data,
       file.path(prep_dir, "try_data.rds"),
       compress = FALSE
+    )
+    data.table::fwrite(
+      attr(try_data, "observation_coordinate_join_audit"),
+      file.path(prep_dir, "observation_coordinate_join_audit.csv")
     )
     data.table::fwrite(
       attr(try_data, "observation_pft_assignment_audit"),

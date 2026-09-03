@@ -25,6 +25,15 @@ DATA_ROOT <- paste0(
   "TRY_meta_analysis"
 )
 
+# TRY trait rows do not contain coordinates in the current RData. This file
+# should contain the table previously stored as
+# na_species_res$observation_coordinates. If that object is already present in
+# the RStudio Global Environment, the in-memory table is used first.
+TRY_OBSERVATION_COORDINATE_FILE <- file.path(
+  DATA_ROOT,
+  "try_observation_coordinates.rds"
+)
+
 OUTPUT_ROOT <- paste0(
   "/projectnb/dietzelab/guYANG/",
   "TRY_meta_analysis"
@@ -49,7 +58,7 @@ MA_WORKERS <- 2L
 # 1. 基础检查和辅助函数
 # ============================================================
 
-MA_PREP_VERSION <- "MA_PREP_RSTUDIO_V2_2026-09-02"
+MA_PREP_VERSION <- "MA_PREP_RSTUDIO_V3_2026-09-03"
 
 load_rdata_object <- function(path, object_name) {
   if (!file.exists(path)) {
@@ -71,6 +80,42 @@ load_rdata_object <- function(path, object_name) {
   }
   
   get(object_name, envir = input_env, inherits = FALSE)
+}
+
+load_coordinate_table <- function(path) {
+  extension <- tolower(tools::file_ext(path))
+
+  if (extension %in% c("csv", "txt", "tsv")) {
+    return(data.table::fread(path, showProgress = FALSE))
+  }
+  if (extension == "rds") {
+    return(readRDS(path))
+  }
+  if (extension %in% c("rdata", "rda")) {
+    coordinate_env <- new.env(parent = emptyenv())
+    loaded_names <- load(path, envir = coordinate_env)
+    preferred_names <- intersect(
+      c("observation_coordinates", "try_observation_coordinates"),
+      loaded_names
+    )
+    if (length(preferred_names) == 1L) {
+      return(get(preferred_names[[1L]], envir = coordinate_env))
+    }
+    if (length(loaded_names) == 1L) {
+      return(get(loaded_names[[1L]], envir = coordinate_env))
+    }
+    stop(
+      "无法从坐标 RData 中识别唯一对象：",
+      paste(loaded_names, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  stop(
+    "不支持的坐标文件格式：", extension,
+    "。请使用 CSV、TSV、RDS 或 RData。",
+    call. = FALSE
+  )
 }
 
 check_positive_integer <- function(value, name) {
@@ -234,6 +279,76 @@ if (nrow(pft_coordinate_map) == 0L) {
   stop("PFT_COORDINATE_MAP_FILE 没有数据行。", call. = FALSE)
 }
 
+observation_coordinate_data <- NULL
+observation_coordinate_source <- NA_character_
+
+if (
+  exists(
+    "na_species_res",
+    envir = .GlobalEnv,
+    inherits = FALSE
+  ) &&
+  is.list(get("na_species_res", envir = .GlobalEnv)) &&
+  !is.null(get("na_species_res", envir = .GlobalEnv)$observation_coordinates)
+) {
+  observation_coordinate_data <- get(
+    "na_species_res",
+    envir = .GlobalEnv
+  )$observation_coordinates
+  observation_coordinate_source <-
+    "RStudio: na_species_res$observation_coordinates"
+} else if (
+  exists(
+    "try_observation_coordinates",
+    envir = .GlobalEnv,
+    inherits = FALSE
+  )
+) {
+  observation_coordinate_data <- get(
+    "try_observation_coordinates",
+    envir = .GlobalEnv
+  )
+  observation_coordinate_source <-
+    "RStudio: try_observation_coordinates"
+} else if (file.exists(TRY_OBSERVATION_COORDINATE_FILE)) {
+  observation_coordinate_data <- load_coordinate_table(
+    TRY_OBSERVATION_COORDINATE_FILE
+  )
+  observation_coordinate_source <- normalizePath(
+    TRY_OBSERVATION_COORDINATE_FILE,
+    mustWork = TRUE
+  )
+}
+
+try_has_coordinate_columns <- all(
+  c("Latitude", "Longitude") %in% names(trydat_use_species)
+)
+
+if (!try_has_coordinate_columns && is.null(observation_coordinate_data)) {
+  stop(
+    "trydat_use_species 没有 Latitude/Longitude，而且没有找到独立的 ",
+    "observation coordinate table。\n",
+    "请先在生成 na_species_res 的 RStudio session 中运行：\n",
+    "saveRDS(na_species_res$observation_coordinates, ",
+    "TRY_OBSERVATION_COORDINATE_FILE)\n",
+    "然后重新 Source ma_prep.R。",
+    call. = FALSE
+  )
+}
+
+if (try_has_coordinate_columns && is.null(observation_coordinate_data)) {
+  observation_coordinate_source <- "embedded in trydat_use_species"
+}
+
+if (!is.null(observation_coordinate_data)) {
+  observation_coordinate_data <- data.table::as.data.table(
+    observation_coordinate_data
+  )
+  if (nrow(observation_coordinate_data) == 0L) {
+    stop("Observation coordinate table 没有数据行。", call. = FALSE)
+  }
+}
+
 pft_name_column <- intersect(
   c(
     "final_pft",
@@ -277,6 +392,7 @@ message("PFT: ", pftname)
 message("CODE_DIR: ", code_dir)
 message("DATA_ROOT: ", data_root)
 message("OUTPUT_ROOT: ", output_root)
+message("TRY observation coordinates: ", observation_coordinate_source)
 message("PFT coordinate map: ", PFT_COORDINATE_MAP_FILE)
 message("PFT maximum assignment distance: ", pft_max_distance_km, " km")
 message("MA iterations: ", ma_iterations)
@@ -350,6 +466,7 @@ try_data <- prepare_single_pft_try_data_for_ma(
   unit_map = unit_map,
   pft_species_map = pftspecies,
   pft_coordinate_map = pft_coordinate_map,
+  observation_coordinate_data = observation_coordinate_data,
   
   unit_col = "UnitName",
   value_col = "StdValue",
@@ -371,6 +488,15 @@ observation_pft_assignment_audit <- attr(
 observation_pft_unassigned <- attr(
   try_data,
   "observation_pft_unassigned"
+)
+observation_coordinate_join_audit <- attr(
+  try_data,
+  "observation_coordinate_join_audit"
+)
+
+data.table::fwrite(
+  observation_coordinate_join_audit,
+  file.path(prep_dir, "observation_coordinate_join_audit.csv")
 )
 
 data.table::fwrite(

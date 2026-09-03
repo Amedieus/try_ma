@@ -1318,6 +1318,228 @@ validate_try_unit_conversion_examples <- function(
 # Complete wrapper: one PFT + trait selection + unit conversion -> try_data
 # ============================================================================
 
+# Join a separately stored observation-coordinate table back to the TRY data.
+# TRY trait exports do not necessarily contain Latitude/Longitude, while the
+# earlier PFT-mapping workflow stores them in
+# na_species_res$observation_coordinates. Never join coordinates by species:
+# use the most specific common observation identifier.
+attach_try_observation_coordinates <- function(
+    try_data,
+    observation_coordinate_data,
+    observation_lat_col = "Latitude",
+    observation_lon_col = "Longitude",
+    key_candidates = c(
+      "ObsDataID",
+      "ObservationID",
+      "OrigObsDataID",
+      "observation_id",
+      "obs_id"
+    )
+) {
+  try_dt <- data.table::copy(data.table::as.data.table(try_data))
+  coordinate_dt <- data.table::copy(
+    data.table::as.data.table(observation_coordinate_data)
+  )
+
+  if (nrow(coordinate_dt) == 0L) {
+    stop("observation_coordinate_data has no rows.", call. = FALSE)
+  }
+
+  normalize_identifier_name <- function(x) {
+    tolower(gsub("[^[:alnum:]]", "", x))
+  }
+  try_normalized_names <- normalize_identifier_name(names(try_dt))
+  coordinate_normalized_names <- normalize_identifier_name(
+    names(coordinate_dt)
+  )
+
+  try_join_key <- NULL
+  lookup_join_key <- NULL
+  for (candidate in key_candidates) {
+    candidate_normalized <- normalize_identifier_name(candidate)
+    try_match <- which(try_normalized_names == candidate_normalized)
+    lookup_match <- which(
+      coordinate_normalized_names == candidate_normalized
+    )
+    if (length(try_match) > 0L && length(lookup_match) > 0L) {
+      try_join_key <- names(try_dt)[try_match[[1L]]]
+      lookup_join_key <- names(coordinate_dt)[lookup_match[[1L]]]
+      break
+    }
+  }
+  if (is.null(try_join_key) || is.null(lookup_join_key)) {
+    stop(
+      "TRY data and observation_coordinate_data have no common observation ",
+      "identifier. Expected one of: ",
+      paste(key_candidates, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  resolve_coordinate_column <- function(x, requested, candidates, label) {
+    if (requested %in% names(x)) {
+      return(requested)
+    }
+    found <- intersect(candidates, names(x))
+    if (length(found) == 0L) {
+      stop(
+        "observation_coordinate_data has no ", label, " column. Tried: ",
+        paste(unique(c(requested, candidates)), collapse = ", "),
+        call. = FALSE
+      )
+    }
+    found[[1L]]
+  }
+
+  lookup_lat_col <- resolve_coordinate_column(
+    coordinate_dt,
+    observation_lat_col,
+    c("lat", "latitude", "Latitude", "LAT", "obs_lat", "try_lat"),
+    "latitude"
+  )
+  lookup_lon_col <- resolve_coordinate_column(
+    coordinate_dt,
+    observation_lon_col,
+    c(
+      "lon", "longitude", "Longitude", "LON", "long",
+      "obs_lon", "try_lon"
+    ),
+    "longitude"
+  )
+
+  coordinate_lookup <- coordinate_dt[
+    ,
+    .(
+      coordinate_join_key__ = trimws(as.character(get(lookup_join_key))),
+      lookup_latitude__ = suppressWarnings(
+        as.numeric(as.character(get(lookup_lat_col)))
+      ),
+      lookup_longitude__ = suppressWarnings(
+        as.numeric(as.character(get(lookup_lon_col)))
+      )
+    )
+  ][
+    !is.na(coordinate_join_key__) & nzchar(coordinate_join_key__)
+  ]
+
+  coordinate_conflicts <- coordinate_lookup[
+    is.finite(lookup_latitude__) & is.finite(lookup_longitude__),
+    .(
+      n_coordinate_pairs = data.table::uniqueN(
+        paste(lookup_latitude__, lookup_longitude__, sep = "|")
+      )
+    ),
+    by = coordinate_join_key__
+  ][n_coordinate_pairs > 1L]
+
+  if (nrow(coordinate_conflicts) > 0L) {
+    stop(
+      nrow(coordinate_conflicts),
+      " observation identifiers have conflicting coordinate pairs in ",
+      "observation_coordinate_data. The coordinate join was not performed.",
+      call. = FALSE
+    )
+  }
+
+  coordinate_lookup <- coordinate_lookup[
+    order(
+      coordinate_join_key__,
+      -as.integer(is.finite(lookup_latitude__) & is.finite(lookup_longitude__))
+    )
+  ][
+    !duplicated(coordinate_join_key__)
+  ]
+
+  if (!observation_lat_col %in% names(try_dt)) {
+    try_dt[, (observation_lat_col) := NA_real_]
+  }
+  if (!observation_lon_col %in% names(try_dt)) {
+    try_dt[, (observation_lon_col) := NA_real_]
+  }
+
+  try_dt[, (observation_lat_col) := suppressWarnings(
+    as.numeric(as.character(get(observation_lat_col)))
+  )]
+  try_dt[, (observation_lon_col) := suppressWarnings(
+    as.numeric(as.character(get(observation_lon_col)))
+  )]
+  try_dt[
+    ,
+    coordinate_join_key__ := trimws(as.character(get(try_join_key)))
+  ]
+
+  valid_before <-
+    is.finite(try_dt[[observation_lat_col]]) &
+    try_dt[[observation_lat_col]] >= -90 &
+    try_dt[[observation_lat_col]] <= 90 &
+    is.finite(try_dt[[observation_lon_col]]) &
+    try_dt[[observation_lon_col]] >= -180 &
+    try_dt[[observation_lon_col]] <= 180
+  n_valid_before <- sum(valid_before)
+
+  try_dt[
+    coordinate_lookup,
+    on = .(coordinate_join_key__),
+    `:=`(
+      joined_latitude__ = i.lookup_latitude__,
+      joined_longitude__ = i.lookup_longitude__
+    )
+  ]
+
+  fill_coordinate <-
+    !valid_before &
+    is.finite(try_dt$joined_latitude__) &
+    try_dt$joined_latitude__ >= -90 &
+    try_dt$joined_latitude__ <= 90 &
+    is.finite(try_dt$joined_longitude__) &
+    try_dt$joined_longitude__ >= -180 &
+    try_dt$joined_longitude__ <= 180
+
+  try_dt[
+    fill_coordinate,
+    (observation_lat_col) := joined_latitude__
+  ]
+  try_dt[
+    fill_coordinate,
+    (observation_lon_col) := joined_longitude__
+  ]
+
+  valid_after <-
+    is.finite(try_dt[[observation_lat_col]]) &
+    try_dt[[observation_lat_col]] >= -90 &
+    try_dt[[observation_lat_col]] <= 90 &
+    is.finite(try_dt[[observation_lon_col]]) &
+    try_dt[[observation_lon_col]] >= -180 &
+    try_dt[[observation_lon_col]] <= 180
+
+  join_audit <- data.table::data.table(
+    join_key = paste0(try_join_key, " -> ", lookup_join_key),
+    try_join_key = try_join_key,
+    lookup_join_key = lookup_join_key,
+    lookup_latitude_column = lookup_lat_col,
+    lookup_longitude_column = lookup_lon_col,
+    n_try_rows = nrow(try_dt),
+    n_coordinate_lookup_rows = nrow(coordinate_lookup),
+    n_valid_coordinates_before_join = n_valid_before,
+    n_coordinates_filled_from_lookup = sum(fill_coordinate),
+    n_valid_coordinates_after_join = sum(valid_after),
+    n_rows_still_without_valid_coordinates = sum(!valid_after)
+  )
+
+  try_dt[
+    ,
+    c(
+      "coordinate_join_key__",
+      "joined_latitude__",
+      "joined_longitude__"
+    ) := NULL
+  ]
+
+  attr(try_dt, "observation_coordinate_join_audit") <- join_audit
+  try_dt[]
+}
+
+
 # Assign each TRY observation to exactly one candidate PFT.
 #
 # Species that occur in only one included PFT inherit that PFT. Species that
@@ -1773,6 +1995,7 @@ prepare_single_pft_try_data_for_ma <- function(
     unit_map,
     pft_species_map,
     pft_coordinate_map,
+    observation_coordinate_data = NULL,
     unit_col = "UnitName",
     value_col = "StdValue",
     observation_lat_col = "Latitude",
@@ -1950,10 +2173,11 @@ prepare_single_pft_try_data_for_ma <- function(
   # --------------------------------------------------------------------------
   # 3. Filter candidate species, then assign every observation to one PFT.
   # --------------------------------------------------------------------------
-  try_source <- data.table::as.data.table(trydat_use_species)
+  try_source <- data.table::copy(
+    data.table::as.data.table(trydat_use_species)
+  )
   required_try_columns <- c(
-    "AccSpeciesID", "TraitName", value_col, unit_col,
-    observation_lat_col, observation_lon_col
+    "AccSpeciesID", "TraitName", value_col, unit_col
   )
   missing_try_columns <- setdiff(required_try_columns, names(try_source))
   if (length(missing_try_columns) > 0L) {
@@ -1975,6 +2199,82 @@ prepare_single_pft_try_data_for_ma <- function(
   if (nrow(try_candidate) == 0L) {
     stop(
       "目标 PFT 的 species 中没有匹配 trait_map 的 TRY records。",
+      call. = FALSE
+    )
+  }
+
+  coordinate_columns_present <- all(
+    c(observation_lat_col, observation_lon_col) %in% names(try_candidate)
+  )
+  if (coordinate_columns_present) {
+    candidate_latitude <- suppressWarnings(as.numeric(
+      as.character(try_candidate[[observation_lat_col]])
+    ))
+    candidate_longitude <- suppressWarnings(as.numeric(
+      as.character(try_candidate[[observation_lon_col]])
+    ))
+    valid_coordinates_before <-
+      is.finite(candidate_latitude) &
+      candidate_latitude >= -90 &
+      candidate_latitude <= 90 &
+      is.finite(candidate_longitude) &
+      candidate_longitude >= -180 &
+      candidate_longitude <= 180
+  } else {
+    valid_coordinates_before <- rep(FALSE, nrow(try_candidate))
+  }
+
+  observation_coordinate_join_audit <- data.table::data.table(
+    join_key = NA_character_,
+    try_join_key = NA_character_,
+    lookup_join_key = NA_character_,
+    lookup_latitude_column = NA_character_,
+    lookup_longitude_column = NA_character_,
+    n_try_rows = nrow(try_candidate),
+    n_coordinate_lookup_rows = if (is.null(observation_coordinate_data)) {
+      NA_integer_
+    } else {
+      nrow(data.table::as.data.table(observation_coordinate_data))
+    },
+    n_valid_coordinates_before_join = sum(valid_coordinates_before),
+    n_coordinates_filled_from_lookup = 0L,
+    n_valid_coordinates_after_join = sum(valid_coordinates_before),
+    n_rows_still_without_valid_coordinates = sum(!valid_coordinates_before)
+  )
+
+  if (!coordinate_columns_present && is.null(observation_coordinate_data)) {
+    stop(
+      "trydat_use_species does not contain Latitude/Longitude columns. ",
+      "Provide observation_coordinate_data, for example ",
+      "na_species_res$observation_coordinates.",
+      call. = FALSE
+    )
+  }
+
+  if (
+    !is.null(observation_coordinate_data) &&
+    (!coordinate_columns_present || any(!valid_coordinates_before))
+  ) {
+    try_candidate <- attach_try_observation_coordinates(
+      try_data = try_candidate,
+      observation_coordinate_data = observation_coordinate_data,
+      observation_lat_col = observation_lat_col,
+      observation_lon_col = observation_lon_col
+    )
+    observation_coordinate_join_audit <- attr(
+      try_candidate,
+      "observation_coordinate_join_audit"
+    )
+  }
+
+  missing_coordinate_columns <- setdiff(
+    c(observation_lat_col, observation_lon_col),
+    names(try_candidate)
+  )
+  if (length(missing_coordinate_columns) > 0L) {
+    stop(
+      "Coordinate join did not create required columns: ",
+      paste(missing_coordinate_columns, collapse = ", "),
       call. = FALSE
     )
   }
@@ -2134,6 +2434,8 @@ prepare_single_pft_try_data_for_ma <- function(
     observation_pft_unassigned
   attr(try_corrected, "observation_pft_assignment_configuration") <-
     observation_pft_assignment_configuration
+  attr(try_corrected, "observation_coordinate_join_audit") <-
+    observation_coordinate_join_audit
   attr(try_corrected, "preparation_summary") <- preparation_summary
   attr(try_corrected, "unit_conversion_audit") <- unit_conversion_audit
   attr(try_corrected, "missing_unit_records") <- missing_unit_records
