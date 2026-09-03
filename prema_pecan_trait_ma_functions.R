@@ -1,6 +1,6 @@
 options(stringsAsFactors = FALSE)
 
-PREMA_PECAN_PIPELINE_VERSION <- "2026-09-03.2"
+PREMA_PECAN_PIPELINE_VERSION <- "2026-09-03.3"
 
 
 # =============================================================================
@@ -1818,6 +1818,7 @@ run_prema_pecan_trait_ma <- function(
     trydat_use_species_rdata,
     pft_coordinate_map_file,
     observation_coordinate_file = NULL,
+    observation_coordinate_data = NULL,
     iterations = 3000L,
     workers = 2L,
     n_output_draws = 1000L,
@@ -1882,13 +1883,25 @@ run_prema_pecan_trait_ma <- function(
     pft_coordinate_map_file,
     c("pft_coordinate_map", "final_pft_sites", "pft_sites")
   )
-  observation_coordinate_data <- NULL
+  observation_coordinate_data_provided <-
+    !is.null(observation_coordinate_data)
   observation_coordinate_path_provided <-
+    !observation_coordinate_data_provided &&
     !is.null(observation_coordinate_file) &&
     length(observation_coordinate_file) == 1L &&
     !is.na(observation_coordinate_file) &&
     nzchar(trimws(observation_coordinate_file))
-  if (observation_coordinate_path_provided) {
+  if (observation_coordinate_data_provided) {
+    observation_coordinate_data <- data.table::as.data.table(
+      observation_coordinate_data
+    )
+    if (nrow(observation_coordinate_data) == 0L) {
+      stop(
+        "observation_coordinate_data was supplied but has zero rows.",
+        call. = FALSE
+      )
+    }
+  } else if (observation_coordinate_path_provided) {
     observation_coordinate_data <- load_prema_table(
       observation_coordinate_file,
       c("observation_coordinates", "try_observation_coordinates")
@@ -2159,6 +2172,15 @@ run_prema_pecan_trait_ma <- function(
         NA_character_
       } else {
         normalizePath(observation_coordinate_file, mustWork = TRUE)
+      },
+      observation_coordinate_source = if (
+        observation_coordinate_data_provided
+      ) {
+        "IN_MEMORY_R_OBJECT"
+      } else if (observation_coordinate_path_provided) {
+        "FILE"
+      } else {
+        "TRY_INPUT_COLUMNS_ONLY"
       },
       max_pft_distance_km = as.numeric(max_pft_distance_km),
       iterations = as.integer(iterations),
