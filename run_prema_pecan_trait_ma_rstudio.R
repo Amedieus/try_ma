@@ -7,10 +7,11 @@ options(stringsAsFactors = FALSE)
 
 
 # -----------------------------------------------------------------------------
-# USER INPUTS: edit only these four values for a normal run
+# USER INPUTS: edit these paths for a normal run
 # -----------------------------------------------------------------------------
 
 PFT_NAME <- "Evergreen_Broadleaf_Forest"
+PFT_NAME <- trimws(PFT_NAME)
 
 OUTPUT_DIR <- file.path(
   "/projectnb/dietzelab/guYANG/TRY_meta_analysis",
@@ -28,6 +29,23 @@ TRYDAT_USE_SPECIES_RDATA <- paste0(
   "trydat_use_species.RData"
 )
 
+# Reference sites carrying final_pft plus latitude/longitude. Ambiguous TRY
+# species are assigned observation-by-observation to the nearest reference
+# point among that species' candidate PFTs.
+PFT_COORDINATE_MAP_FILE <- paste0(
+  "/projectnb/dietzelab/guYANG/",
+  "SIPNET_Model_Calibration/Final_PFT_assignment_v4/",
+  "final_8000_sites_with_final_pft_v4.csv"
+)
+
+# Set to NA_character_ only when trydat_use_species already contains usable
+# Latitude and Longitude columns. Otherwise this should be the table saved from
+# na_species_res$observation_coordinates.
+TRY_OBSERVATION_COORDINATE_FILE <- file.path(
+  "/projectnb/dietzelab/guYANG/TRY_meta_analysis",
+  "try_observation_coordinates.rds"
+)
+
 
 # -----------------------------------------------------------------------------
 # Optional run controls
@@ -38,6 +56,7 @@ MA_WORKERS <- 2L
 N_OUTPUT_DRAWS <- 1000L
 RANDOM_SEED <- 20260903L
 RESUME_EXISTING_TRAIT_RUNS <- TRUE
+PFT_MAX_DISTANCE_KM <- 250
 
 # `new_site_predictive` exports beta.o + a newly sampled site effect whenever
 # sd.site passed its own convergence checks. Use `global_mean` only when a
@@ -113,7 +132,7 @@ for (source_file in SOURCE_FILES) {
 
 
 # -----------------------------------------------------------------------------
-# Validate the four user inputs
+# Validate the user inputs
 # -----------------------------------------------------------------------------
 
 if (length(PFT_NAME) != 1L || is.na(PFT_NAME) || !nzchar(trimws(PFT_NAME))) {
@@ -122,10 +141,26 @@ if (length(PFT_NAME) != 1L || is.na(PFT_NAME) || !nzchar(trimws(PFT_NAME))) {
 if (length(OUTPUT_DIR) != 1L || is.na(OUTPUT_DIR) || !nzchar(OUTPUT_DIR)) {
   stop("OUTPUT_DIR must be one non-empty path.", call. = FALSE)
 }
-for (input_file in c(PFTSPECIES_RDATA, TRYDAT_USE_SPECIES_RDATA)) {
+required_input_files <- c(
+  PFTSPECIES_RDATA,
+  TRYDAT_USE_SPECIES_RDATA,
+  PFT_COORDINATE_MAP_FILE
+)
+for (input_file in required_input_files) {
   if (!file.exists(input_file)) {
-    stop("Cannot find input RData: ", input_file, call. = FALSE)
+    stop("Cannot find required input file: ", input_file, call. = FALSE)
   }
+}
+if (
+  !is.na(TRY_OBSERVATION_COORDINATE_FILE) &&
+  nzchar(trimws(TRY_OBSERVATION_COORDINATE_FILE)) &&
+  !file.exists(TRY_OBSERVATION_COORDINATE_FILE)
+) {
+  stop(
+    "Cannot find TRY observation coordinate file: ",
+    TRY_OBSERVATION_COORDINATE_FILE,
+    call. = FALSE
+  )
 }
 
 
@@ -146,6 +181,8 @@ prema_result <- run_prema_pecan_trait_ma(
   output_dir = OUTPUT_DIR,
   pftspecies_rdata = PFTSPECIES_RDATA,
   trydat_use_species_rdata = TRYDAT_USE_SPECIES_RDATA,
+  pft_coordinate_map_file = PFT_COORDINATE_MAP_FILE,
+  observation_coordinate_file = TRY_OBSERVATION_COORDINATE_FILE,
   iterations = MA_ITERATIONS,
   workers = MA_WORKERS,
   n_output_draws = N_OUTPUT_DRAWS,
@@ -154,6 +191,7 @@ prema_result <- run_prema_pecan_trait_ma(
   include_site_variability_in_samples = TRUE,
   sample_mode = PECAN_SAMPLE_MODE,
   unsupported_unit_action = "stop",
+  max_pft_distance_km = PFT_MAX_DISTANCE_KM,
   resume = RESUME_EXISTING_TRAIT_RUNS
 )
 
