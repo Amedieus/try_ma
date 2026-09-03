@@ -29,9 +29,10 @@ DATA_ROOT <- paste0(
 # should contain the table previously stored as
 # na_species_res$observation_coordinates. If that object is already present in
 # the RStudio Global Environment, the in-memory table is used first.
-TRY_OBSERVATION_COORDINATE_FILE <- file.path(
-  DATA_ROOT,
-  "try_observation_coordinates.rds"
+TRY_OBSERVATION_COORDINATE_FILE <- paste0(
+  "/projectnb/dietzelab/guYANG/",
+  "SIPNET_Model_Calibration/PFT_species_map/",
+  "try_observation_coordinates_north_america.csv"
 )
 
 OUTPUT_ROOT <- paste0(
@@ -857,7 +858,7 @@ ma_result <-
     outdir = ma_dir,
     
     iterations = ma_iterations,
-    random = FALSE,
+    random = TRUE,
     threshold = 1.2,
     use_ghs = FALSE,
     gamma_tau = 0.01,
