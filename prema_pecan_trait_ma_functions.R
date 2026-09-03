@@ -1,6 +1,6 @@
 options(stringsAsFactors = FALSE)
 
-PREMA_PECAN_PIPELINE_VERSION <- "2026-09-03.4"
+PREMA_PECAN_PIPELINE_VERSION <- "2026-09-03.5"
 
 
 # =============================================================================
@@ -2197,7 +2197,8 @@ run_prema_pecan_trait_ma <- function(
     ma_result = ma_result,
     trait.data = trait.data,
     outdir = qc_dir,
-    range_rules = range_rules
+    range_rules = range_rules,
+    classification_policy = "minimum_bridge"
   )
   saveRDS(
     ma_qc,
@@ -2259,6 +2260,7 @@ run_prema_pecan_trait_ma <- function(
     output_dir = output_dir,
     random_effects = TRUE,
     sample_mode = sample_mode,
+    ma_qc_policy = ma_qc$classification_policy,
     pft_assignment_mode = pft_assignment_mode,
     n_selected_unique_species_rows =
       pft_selection_audit$selected_unique_species_rows,
@@ -2341,6 +2343,7 @@ run_prema_pecan_trait_ma <- function(
       iterations = as.integer(iterations),
       workers = as.integer(workers),
       random = TRUE,
+      ma_qc_policy = ma_qc$classification_policy,
       include_site_variability_in_samples =
         include_site_variability_in_samples,
       sample_mode = sample_mode,

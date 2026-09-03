@@ -778,14 +778,18 @@ subset_pecan_ma_result <- function(ma_result, traits) {
 
 # Post-meta-analysis quality control.
 #
-# This function does not repair data after MA. It identifies traits that are
-# safe to pass forward, traits requiring manual review, and traits that failed
-# hard checks. Unit or range problems must be corrected upstream and rerun.
+# This function does not repair data after MA. `minimum_bridge` is the default
+# policy because PEcAn has already applied its own MPSRF convergence screen:
+# only an unusable beta.o posterior or a physical-range violation blocks a
+# trait. All other diagnostics remain visible in `flags` but do not prevent the
+# posterior from passing to the bridge. Use `strict` to restore the older
+# secondary screening behavior.
 qc_pecan_ma_result <- function(
     ma_result,
     trait.data,
     outdir = NULL,
     range_rules = NULL,
+    classification_policy = c("minimum_bridge", "strict"),
     min_rows = 2L,
     min_unique_values = 2L,
     rhat_threshold = 1.2,
@@ -802,6 +806,7 @@ qc_pecan_ma_result <- function(
   if (!requireNamespace("coda", quietly = TRUE)) {
     stop("Package `coda` is required.", call. = FALSE)
   }
+  classification_policy <- match.arg(classification_policy)
   
   required_elements <- c("trait.mcmc", "post.distns", "jagged.data")
   missing_elements <- setdiff(required_elements, names(ma_result))
@@ -1116,27 +1121,56 @@ qc_pecan_ma_result <- function(
       review_flags <- c(review_flags, "no_valid_error_statistics")
     }
     
-    qc_status <- if (length(fail_flags) > 0L) {
+    classification_fail_flags <- fail_flags
+    classification_review_flags <- review_flags
+    ignored_fail_flags <- character()
+    ignored_review_flags <- character()
+
+    if (identical(classification_policy, "minimum_bridge")) {
+      # A beta.o column with no finite draws is not usable downstream and is
+      # therefore treated as equivalent to a missing beta.o posterior.
+      blocking_fail_flags <- c(
+        "mcmc_not_retained_or_beta_o_missing",
+        "nonfinite_beta_o_posterior",
+        "outside_physical_range"
+      )
+      classification_fail_flags <- intersect(
+        fail_flags,
+        blocking_fail_flags
+      )
+      ignored_fail_flags <- setdiff(fail_flags, classification_fail_flags)
+      ignored_review_flags <- review_flags
+      classification_review_flags <- character()
+    }
+
+    qc_status <- if (length(classification_fail_flags) > 0L) {
       "FAIL"
-    } else if (length(review_flags) > 0L) {
+    } else if (length(classification_review_flags) > 0L) {
       "REVIEW"
     } else {
       "PASS"
     }
     
     all_flags <- c(
-      paste0("FAIL:", fail_flags),
-      paste0("REVIEW:", review_flags)
+      paste0("FAIL:", classification_fail_flags),
+      paste0("REVIEW:", classification_review_flags),
+      paste0("IGNORED_FAIL:", ignored_fail_flags),
+      paste0("IGNORED_REVIEW:", ignored_review_flags)
     )
     
     data.frame(
       trait = trait_name,
       status = qc_status,
       use_for_bridge = identical(qc_status, "PASS"),
+      classification_policy = classification_policy,
       flags = if (length(all_flags) == 0L) "" else paste(
         all_flags,
         collapse = ";"
       ),
+      n_diagnostic_fail_flags = length(fail_flags),
+      n_diagnostic_review_flags = length(review_flags),
+      n_ignored_diagnostic_flags =
+        length(ignored_fail_flags) + length(ignored_review_flags),
       n_input = n_input,
       n_analyzed = n_analyzed,
       n_unique_values = n_unique,
@@ -1191,6 +1225,7 @@ qc_pecan_ma_result <- function(
     )
     
     qc_decisions <- list(
+      classification_policy = classification_policy,
       passed_traits = passed_traits,
       review_traits = review_traits,
       failed_traits = failed_traits,
@@ -1232,12 +1267,14 @@ qc_pecan_ma_result <- function(
   }
   
   message(
-    "MA QC complete. PASS: ", length(passed_traits),
+    "MA QC (", classification_policy, ") complete. PASS: ",
+    length(passed_traits),
     "; REVIEW: ", length(review_traits),
     "; FAIL: ", length(failed_traits), "."
   )
   
   list(
+    classification_policy = classification_policy,
     summary = qc_summary,
     passed_traits = passed_traits,
     review_traits = review_traits,
