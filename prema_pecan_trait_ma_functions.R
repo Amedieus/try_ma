@@ -1,6 +1,6 @@
 options(stringsAsFactors = FALSE)
 
-PREMA_PECAN_PIPELINE_VERSION <- "2026-09-03.1"
+PREMA_PECAN_PIPELINE_VERSION <- "2026-09-03.2"
 
 
 # =============================================================================
@@ -88,10 +88,10 @@ prema_pecan_targets_21 <- function() {
 }
 
 
-# Ordered source lists. The first available source becomes the primary source
-# that determines the number of pseudo-observations and their site metadata.
-# Sources that merely triggered a default in the old all-enabled bridge but
-# were not used numerically are deliberately excluded here.
+# Ordered source lists. Every available source can anchor independent target
+# observations; the order is used only to resolve duplicate routes for the
+# same source observation. Sources that merely triggered a default in the old
+# all-enabled bridge but were not used numerically are deliberately excluded.
 prema_target_source_registry_21 <- function() {
   list(
     SLA = c(
@@ -289,15 +289,54 @@ load_prema_rdata_object <- function(path, preferred_names) {
 }
 
 
-# With only the two user-supplied RData files, ambiguous species cannot be
-# spatially assigned unless an observation-level PFT assignment is already in
-# the TRY object. Such rows are excluded instead of copied to every PFT.
+# Read a coordinate/reference table without loading its objects into the global
+# environment. CSV/TSV, RDS, and RData inputs are accepted so the spatial PFT
+# workflow can reuse the same files as `ma_prep.R`.
+load_prema_table <- function(path, preferred_names = character()) {
+  if (length(path) != 1L || is.na(path) || !nzchar(trimws(path))) {
+    stop("A non-empty table path is required.", call. = FALSE)
+  }
+  if (!file.exists(path)) {
+    stop("Cannot find table input: ", path, call. = FALSE)
+  }
+
+  extension <- tolower(tools::file_ext(path))
+  if (extension %in% c("csv", "txt", "tsv")) {
+    return(data.table::fread(path, showProgress = FALSE))
+  }
+  if (extension == "rds") {
+    return(readRDS(path))
+  }
+  if (extension %in% c("rdata", "rda")) {
+    return(load_prema_rdata_object(path, preferred_names))
+  }
+  stop(
+    "Unsupported table format `", extension,
+    "`. Use CSV, TSV, RDS, RData, or RDA.",
+    call. = FALSE
+  )
+}
+
+
+# Reuse the repository's observation-level spatial assignment. Species that
+# occur in one PFT inherit that PFT. For species mapped to multiple PFTs, each
+# TRY observation is assigned to the nearest reference point among only that
+# species' candidate PFTs. Every observation therefore enters at most one PFT.
 select_prema_pft_observations <- function(
     trydat_use_species,
     pftspecies,
-    pft_name
+    pft_name,
+    pft_coordinate_map,
+    observation_coordinate_data = NULL,
+    observation_lat_col = "Latitude",
+    observation_lon_col = "Longitude",
+    max_distance_km = 250
 ) {
   .prema_require_packages("data.table")
+  .prema_require_functions(c(
+    "attach_try_observation_coordinates",
+    "assign_try_observations_to_pft"
+  ))
   try_dt <- data.table::copy(data.table::as.data.table(trydat_use_species))
   pft_dt <- data.table::copy(data.table::as.data.table(pftspecies))
 
@@ -352,96 +391,144 @@ select_prema_pft_observations <- function(
   ]
   pft_dt[, species_key__ := trimws(as.character(try_species_id))]
   pft_dt[, pft_key__ := trimws(as.character(final_pft))]
-  pft_dt <- unique(pft_dt[, .(species_key__, pft_key__)])
-
-  species_map <- pft_dt[
-    ,
-    .(
-      n_candidate_pfts = data.table::uniqueN(pft_key__),
-      target_candidate = pft_name %in% pft_key__,
-      only_pft = if (data.table::uniqueN(pft_key__) == 1L) {
-        unique(pft_key__)[[1L]]
-      } else {
-        NA_character_
-      },
-      candidate_pfts = paste(sort(unique(pft_key__)), collapse = "|")
-    ),
-    by = species_key__
-  ]
-
-  try_dt[, input_row_id__ := .I]
-  try_dt[, species_key__ := trimws(as.character(AccSpeciesID))]
-  try_dt[
-    species_map,
-    on = .(species_key__),
-    `:=`(
-      n_candidate_pfts__ = i.n_candidate_pfts,
-      target_candidate__ = i.target_candidate,
-      only_pft__ = i.only_pft,
-      candidate_pfts__ = i.candidate_pfts
-    )
-  ]
-
-  assignment_column <- intersect(
-    c("assigned_final_pft", "observation_final_pft", "final_pft"),
-    names(try_dt)
+  target_species <- unique(
+    pft_dt[pft_key__ == pft_name, species_key__]
   )
-  assignment_column <- if (length(assignment_column) > 0L) {
-    assignment_column[[1L]]
-  } else {
-    NA_character_
-  }
-  observation_assignment <- if (!is.na(assignment_column)) {
-    trimws(as.character(try_dt[[assignment_column]]))
-  } else {
-    rep(NA_character_, nrow(try_dt))
+  if (length(target_species) == 0L) {
+    stop(
+      "pftspecies has no included species for target PFT `",
+      pft_name, "`.",
+      call. = FALSE
+    )
   }
 
-  unique_species_use <-
-    !is.na(try_dt$n_candidate_pfts__) &
-    try_dt$n_candidate_pfts__ == 1L &
-    try_dt$only_pft__ == pft_name
-  ambiguous_target <-
-    !is.na(try_dt$n_candidate_pfts__) &
-    try_dt$n_candidate_pfts__ > 1L &
-    try_dt$target_candidate__ %in% TRUE
-  ambiguous_assigned_use <-
-    ambiguous_target &
-    !is.na(observation_assignment) &
-    observation_assignment == pft_name
+  input_try_rows <- nrow(try_dt)
+  try_dt[, species_key_prema__ := trimws(as.character(AccSpeciesID))]
+  candidates <- data.table::copy(
+    try_dt[species_key_prema__ %in% target_species]
+  )
+  candidates[, species_key_prema__ := NULL]
+  if (nrow(candidates) == 0L) {
+    stop(
+      "No TRY rows belong to species that are candidates for PFT `",
+      pft_name, "`.",
+      call. = FALSE
+    )
+  }
 
-  use <- unique_species_use | ambiguous_assigned_use
-  excluded_ambiguous <- try_dt[ambiguous_target & !ambiguous_assigned_use]
-  selected <- data.table::copy(try_dt[use])
+  coordinate_columns_present <- all(
+    c(observation_lat_col, observation_lon_col) %in% names(candidates)
+  )
+  if (coordinate_columns_present) {
+    latitude <- suppressWarnings(as.numeric(
+      as.character(candidates[[observation_lat_col]])
+    ))
+    longitude <- suppressWarnings(as.numeric(
+      as.character(candidates[[observation_lon_col]])
+    ))
+    valid_before <-
+      is.finite(latitude) & latitude >= -90 & latitude <= 90 &
+      is.finite(longitude) & longitude >= -180 & longitude <= 180
+  } else {
+    valid_before <- rep(FALSE, nrow(candidates))
+  }
+
+  coordinate_join_audit <- data.table::data.table(
+    n_try_rows = nrow(candidates),
+    n_valid_coordinates_before_join = sum(valid_before),
+    n_coordinates_filled_from_lookup = 0L,
+    n_valid_coordinates_after_join = sum(valid_before),
+    n_rows_still_without_valid_coordinates = sum(!valid_before)
+  )
+  if (!is.null(observation_coordinate_data) && any(!valid_before)) {
+    candidates <- attach_try_observation_coordinates(
+      try_data = candidates,
+      observation_coordinate_data = observation_coordinate_data,
+      observation_lat_col = observation_lat_col,
+      observation_lon_col = observation_lon_col
+    )
+    coordinate_join_audit <- attr(
+      candidates,
+      "observation_coordinate_join_audit"
+    )
+  }
+
+  # `assign_try_observations_to_pft()` accepts missing coordinates for
+  # single-PFT species, but it requires the two columns to exist.
+  if (!observation_lat_col %in% names(candidates)) {
+    candidates[, (observation_lat_col) := NA_real_]
+  }
+  if (!observation_lon_col %in% names(candidates)) {
+    candidates[, (observation_lon_col) := NA_real_]
+  }
+
+  assigned <- assign_try_observations_to_pft(
+    try_data = candidates,
+    pft_species_map = pft_dt,
+    pft_coordinate_map = pft_coordinate_map,
+    species_col = "AccSpeciesID",
+    observation_lat_col = observation_lat_col,
+    observation_lon_col = observation_lon_col,
+    max_distance_km = max_distance_km,
+    unassigned_action = "drop"
+  )
+  assignment_audit <- attr(assigned, "observation_pft_assignment_audit")
+  unassigned <- attr(assigned, "observation_pft_unassigned")
+  assignment_configuration <- attr(
+    assigned,
+    "observation_pft_assignment_configuration"
+  )
+  if (nrow(unassigned) > 0L) {
+    warning(
+      nrow(unassigned),
+      " candidate TRY observations could not be assigned to one PFT and ",
+      "were excluded. Inspect excluded_ambiguous_rows.csv.",
+      call. = FALSE
+    )
+  }
+
+  selected <- data.table::copy(
+    assigned[
+      pft_assignment_status == "ASSIGNED" &
+        assigned_final_pft == pft_name
+    ]
+  )
 
   if (nrow(selected) == 0L) {
     stop(
-      "No TRY rows can be assigned safely to PFT `", pft_name,
-      "` from the two supplied RData files.",
+      "No TRY observations were spatially assigned to PFT `", pft_name,
+      "`. Inspect the assignment audit and coordinate inputs.",
       call. = FALSE
     )
   }
 
   selected[, final_pft := pft_name]
-  selected[, pft_assignment_method_prema := data.table::fifelse(
-    n_candidate_pfts__ == 1L,
-    "UNIQUE_SPECIES_PFT",
-    paste0("EXISTING_OBSERVATION_ASSIGNMENT:", assignment_column)
-  )]
+  selected[, pft_assignment_method_prema := pft_assignment_method]
 
   audit <- data.table::data.table(
     pft = pft_name,
-    input_try_rows = nrow(try_dt),
-    target_candidate_species = species_map[target_candidate == TRUE, .N],
+    input_try_rows = input_try_rows,
+    target_candidate_species = length(target_species),
+    target_candidate_rows = nrow(candidates),
     selected_rows = nrow(selected),
-    selected_unique_species_rows = sum(unique_species_use),
-    selected_existing_observation_assignment_rows = sum(ambiguous_assigned_use),
-    excluded_ambiguous_rows = nrow(excluded_ambiguous),
-    observation_assignment_column = assignment_column
+    selected_unique_species_rows = selected[
+      pft_assignment_method == "unique_species_pft", .N
+    ],
+    selected_spatial_rows = selected[
+      pft_assignment_method == "nearest_candidate_pft_coordinate", .N
+    ],
+    excluded_ambiguous_rows = nrow(unassigned),
+    excluded_unassigned_candidate_rows = nrow(unassigned),
+    max_distance_km = as.numeric(max_distance_km)
   )
 
   attr(selected, "pft_selection_audit") <- audit
-  attr(selected, "excluded_ambiguous_rows") <- excluded_ambiguous
+  attr(selected, "excluded_ambiguous_rows") <- unassigned
+  attr(selected, "observation_pft_assignment_audit") <- assignment_audit
+  attr(selected, "observation_pft_assignment_configuration") <-
+    assignment_configuration
+  attr(selected, "observation_coordinate_join_audit") <-
+    coordinate_join_audit
   selected[]
 }
 
@@ -601,6 +688,46 @@ select_prema_pft_observations <- function(
 }
 
 
+.prema_combine_pairing_modes <- function(current, candidate) {
+  levels <- c(
+    "DIRECT_OBSERVATION" = 0L,
+    "PRIMARY_SOURCE" = 0L,
+    "SAME_OBSERVATION_ID" = 1L,
+    "SAME_DATASET_AND_SPECIES" = 2L,
+    "SAME_SPECIES" = 3L,
+    "UNPAIRED_PFT_SAMPLE" = 4L
+  )
+  current_rank <- unname(levels[current])
+  candidate_rank <- unname(levels[candidate])
+  current_rank[is.na(current_rank)] <- 0L
+  candidate_rank[is.na(candidate_rank)] <- 0L
+  use_candidate <- candidate_rank > current_rank
+  current[use_candidate] <- candidate[use_candidate]
+  current
+}
+
+
+.prema_split_source_traits <- function(x) {
+  x <- as.character(x)
+  x <- x[!is.na(x) & nzchar(x)]
+  if (length(x) == 0L) return(character())
+  unique(trimws(unlist(strsplit(x, "|", fixed = TRUE))))
+}
+
+
+.prema_observation_dedup_key <- function(x) {
+  id <- .prema_nonempty_text(x$source_observation_id)
+  dataset <- .prema_nonempty_text(x$dataset_key)
+  species <- .prema_nonempty_text(x$species_key)
+  dataset[is.na(dataset)] <- "unknown_dataset"
+  species[is.na(species)] <- "unknown_species"
+  id[is.na(id)] <- paste0(
+    "generated_", x$anchor_source[is.na(id)], "_", which(is.na(id))
+  )
+  paste(dataset, species, id, sep = "\u001f")
+}
+
+
 .prema_run_two_pass_bridge <- function(draws, context, models, target) {
   model_dependencies <- unique(c("SLA", "Amax", target))
   models_use <- models[
@@ -653,8 +780,39 @@ select_prema_pft_observations <- function(
   use_2 <- !is.finite(value) & is.finite(value_2)
   value[use_2] <- suppressWarnings(as.numeric(value_2[use_2]))
 
+  # Pass 2 contains pass-1 targets as input columns. Its automatic direct-trait
+  # audit entry is therefore an implementation detail, not evidence that the
+  # original TRY observation was a direct writer trait. Keep only the attempts
+  # that actually generated the chosen pass-1/pass-2 values.
+  winning_attempts <- list()
+  if (any(is.finite(value_1))) {
+    winning_attempts[[length(winning_attempts) + 1L]] <- attempts_1[
+      target_pecan_trait == target & n_filled > 0L
+    ]
+  }
+  if (any(use_2)) {
+    winning_attempts[[length(winning_attempts) + 1L]] <- attempts_2[
+      target_pecan_trait == target &
+        n_filled > 0L &
+        !(
+          conversion_class == "DIRECT_WRITER_TRAIT" &
+          source_traits == target
+        )
+    ]
+  }
+  winning_attempts <- if (length(winning_attempts) > 0L) {
+    data.table::rbindlist(
+      winning_attempts,
+      use.names = TRUE,
+      fill = TRUE
+    )
+  } else {
+    data.table::data.table()
+  }
+
   list(
     value = value,
+    successful_attempts = winning_attempts,
     attempts = data.table::rbindlist(
       list(attempts_1, attempts_2),
       use.names = TRUE,
@@ -725,6 +883,8 @@ build_prema_pecan_target_observations <- function(
   for (target_index in seq_along(targets)) {
     target <- targets[[target_index]]
     target_unit <- contract[pecan_trait == target, pecan_input_unit][[1L]]
+    target_candidates <- list()
+    target_rules <- list()
     direct <- data.table::copy(x[pecan_vname == target])
 
     if (nrow(direct) > 0L) {
@@ -739,6 +899,8 @@ build_prema_pecan_target_observations <- function(
         source_traits = target,
         conversion_formula = "identity after canonical unit conversion",
         pairing_mode = "DIRECT_OBSERVATION",
+        anchor_source = target,
+        route_priority = 0L,
         uses_default_context = FALSE,
         proxy_sdlog = 0,
         source_observation_id = meta$source_observation_id,
@@ -753,20 +915,8 @@ build_prema_pecan_target_observations <- function(
         time = meta$time,
         domain_valid = valid
       )
-      observation_results[[target_index]] <- out[domain_valid == TRUE]
-      target_audit[[target_index]] <- data.table::data.table(
-        pecan_trait = target,
-        target_unit = target_unit,
-        target_status = if (any(valid)) "DIRECT_OBSERVED" else "NO_VALID_VALUE",
-        primary_source = target,
-        available_sources = target,
-        n_candidate = nrow(out),
-        n_valid = sum(valid),
-        n_invalid_domain = sum(!valid),
-        source_class = "DIRECT_OBSERVED",
-        pairing_modes = "DIRECT_OBSERVATION"
-      )
-      rule_audit[[target_index]] <- data.table::data.table(
+      target_candidates[[length(target_candidates) + 1L]] <- out
+      target_rules[[length(target_rules) + 1L]] <- data.table::data.table(
         target_pecan_trait = target,
         source_traits = target,
         conversion_class = "DIRECT_WRITER_TRAIT",
@@ -774,165 +924,256 @@ build_prema_pecan_target_observations <- function(
         n_candidate = nrow(out),
         n_filled = sum(valid),
         status = if (any(valid)) "FILLED" else "NOT_FILLED",
-        note = "Direct observations have priority; lower-priority routes were not added.",
-        bridge_pass = 0L
+        note = paste(
+          "Direct observations have priority only when another route has the",
+          "same source observation; independent lower-priority routes are retained."
+        ),
+        bridge_pass = 0L,
+        anchor_source = target,
+        route_priority = 0L,
+        anchor_used_by_route = TRUE
       )
-      next
     }
 
     sources <- registry[[target]]
     available <- sources[sources %in% unique(x$pecan_vname)]
-    if (length(available) == 0L) {
-      observation_results[[target_index]] <- data.table::data.table()
-      target_audit[[target_index]] <- data.table::data.table(
-        pecan_trait = target,
-        target_unit = target_unit,
-        target_status = "DEFAULT_ONLY_NO_TRY_SOURCE",
-        primary_source = "",
-        available_sources = "",
-        n_candidate = 0L,
-        n_valid = 0L,
-        n_invalid_domain = 0L,
-        source_class = "DEFAULT_ONLY",
-        pairing_modes = ""
-      )
-      rule_audit[[target_index]] <- data.table::data.table()
-      next
-    }
-
-    primary_source <- available[[1L]]
-    primary <- data.table::copy(x[pecan_vname == primary_source])
-    base_meta <- .prema_source_metadata(primary)
-    bridge_draws <- data.table::data.table(
-      draw_id = seq_len(nrow(primary))
-    )
-    data.table::set(
-      bridge_draws,
-      j = primary_source,
-      value = primary$StdValue
-    )
-    pairing_mode <- rep("PRIMARY_SOURCE", nrow(primary))
-
-    for (source_i in setdiff(available, primary_source)) {
-      aligned <- .prema_align_secondary_source(
-        base_meta,
-        x[pecan_vname == source_i]
-      )
-      data.table::set(
-        bridge_draws,
-        j = source_i,
-        value = aligned$value
-      )
-      pairing_mode <- ifelse(
-        pairing_mode == "UNPAIRED_PFT_SAMPLE" |
-          aligned$pairing_mode == "UNPAIRED_PFT_SAMPLE",
-        "UNPAIRED_PFT_SAMPLE",
-        ifelse(
-          aligned$pairing_mode == "SAME_SPECIES",
-          "SAME_SPECIES",
-          ifelse(
-            aligned$pairing_mode == "SAME_DATASET_AND_SPECIES",
-            "SAME_DATASET_AND_SPECIES",
-            ifelse(
-              aligned$pairing_mode == "SAME_OBSERVATION_ID",
-              "SAME_OBSERVATION_ID",
-              pairing_mode
-            )
-          )
+    if (length(available) > 0L) {
+      # Every available source gets a chance to anchor independent candidate
+      # observations. The direct target column is deliberately not aligned
+      # here: direct values should only override a derived value when both
+      # belong to the same source observation during the final deduplication.
+      for (anchor_index in seq_along(available)) {
+        anchor_source <- available[[anchor_index]]
+        anchor <- data.table::copy(x[pecan_vname == anchor_source])
+        base_meta <- .prema_source_metadata(anchor)
+        bridge_draws <- data.table::data.table(
+          draw_id = seq_len(nrow(anchor))
         )
+        data.table::set(
+          bridge_draws,
+          j = anchor_source,
+          value = anchor$StdValue
+        )
+        pairing_by_source <- list()
+        pairing_by_source[[anchor_source]] <- rep(
+          "PRIMARY_SOURCE",
+          nrow(anchor)
+        )
+
+        for (source_i in setdiff(available, anchor_source)) {
+          aligned <- .prema_align_secondary_source(
+            base_meta,
+            x[pecan_vname == source_i]
+          )
+          data.table::set(
+            bridge_draws,
+            j = source_i,
+            value = aligned$value
+          )
+          pairing_by_source[[source_i]] <- aligned$pairing_mode
+        }
+
+        bridge_run <- .prema_run_two_pass_bridge(
+          draws = bridge_draws,
+          context = context,
+          models = models,
+          target = target
+        )
+        successful_attempts <- bridge_run$successful_attempts
+        used_sources <- .prema_split_source_traits(
+          successful_attempts$source_traits
+        )
+        anchor_used <- anchor_source %in% used_sources
+
+        route_rules <- data.table::copy(
+          bridge_run$attempts[target_pecan_trait == target]
+        )
+        if (nrow(route_rules) > 0L) {
+          route_rules[, `:=`(
+            anchor_source = anchor_source,
+            route_priority = as.integer(anchor_index),
+            anchor_used_by_route = anchor_used
+          )]
+          target_rules[[length(target_rules) + 1L]] <- route_rules
+        }
+
+        # Do not count a row under an anchor that the successful conversion
+        # did not actually use. This prevents unrelated aligned sources from
+        # multiplying identical pseudo-observations.
+        if (!anchor_used || nrow(successful_attempts) == 0L) next
+
+        pairing_mode <- rep("PRIMARY_SOURCE", nrow(anchor))
+        for (source_i in intersect(used_sources, names(pairing_by_source))) {
+          pairing_mode <- .prema_combine_pairing_modes(
+            pairing_mode,
+            pairing_by_source[[source_i]]
+          )
+        }
+
+        value <- bridge_run$value
+        conversion_classes <- unique(successful_attempts$conversion_class)
+        conversion_class <- .prema_classify_conversion(
+          conversion_classes,
+          pairing_mode
+        )
+
+        # Keep the existing permissive fallback requested by the user, while
+        # preserving its pairing label and adding uncertainty to algebraic
+        # PFT-wide combinations.
+        add_unpaired_noise <-
+          any(pairing_mode == "UNPAIRED_PFT_SAMPLE") &
+          !any(conversion_classes == "USER_SUPPLIED_MODEL") &
+          is.finite(unpaired_sdlog) & unpaired_sdlog > 0
+        if (add_unpaired_noise) {
+          positive <- is.finite(value) & value > 0
+          value[positive] <- value[positive] * exp(stats::rnorm(
+            sum(positive),
+            mean = -0.5 * unpaired_sdlog^2,
+            sd = unpaired_sdlog
+          ))
+        }
+
+        valid <- .prema_target_domain_valid(target, value)
+        source_text <- paste(
+          unique(successful_attempts$source_traits),
+          collapse = "|"
+        )
+        formula_text <- paste(
+          unique(successful_attempts$formula),
+          collapse = " | "
+        )
+        out <- data.table::data.table(
+          pecan_trait = target,
+          target_value = value,
+          target_unit = target_unit,
+          source_class = conversion_class,
+          source_traits = source_text,
+          conversion_formula = formula_text,
+          pairing_mode = pairing_mode,
+          anchor_source = anchor_source,
+          route_priority = as.integer(anchor_index),
+          uses_default_context = TRUE,
+          proxy_sdlog = if (add_unpaired_noise) {
+            unpaired_sdlog
+          } else {
+            NA_real_
+          },
+          source_observation_id = base_meta$source_observation_id,
+          species_key = base_meta$species_key,
+          species_name = base_meta$species_name,
+          dataset_key = base_meta$dataset_key,
+          reference_key = base_meta$reference_key,
+          latitude = base_meta$latitude,
+          longitude = base_meta$longitude,
+          replicates = ifelse(
+            pairing_mode %in% c("PRIMARY_SOURCE", "SAME_OBSERVATION_ID"),
+            base_meta$replicates,
+            1
+          ),
+          date = base_meta$date,
+          time = base_meta$time,
+          domain_valid = valid
+        )
+        target_candidates[[length(target_candidates) + 1L]] <- out
+      }
+    }
+
+    candidate_table <- if (length(target_candidates) > 0L) {
+      data.table::rbindlist(
+        target_candidates,
+        use.names = TRUE,
+        fill = TRUE
       )
-    }
-
-    bridge_run <- .prema_run_two_pass_bridge(
-      draws = bridge_draws,
-      context = context,
-      models = models,
-      target = target
-    )
-    value <- bridge_run$value
-    successful_attempts <- bridge_run$attempts[
-      target_pecan_trait == target & n_filled > 0L
-    ]
-    conversion_classes <- unique(successful_attempts$conversion_class)
-    conversion_class <- .prema_classify_conversion(
-      conversion_classes,
-      pairing_mode
-    )
-
-    # Add explicit uncertainty only for an unpaired algebraic construction.
-    # Existing USER_SUPPLIED_MODEL functions already add their own residual
-    # uncertainty and are not perturbed a second time here.
-    add_unpaired_noise <-
-      any(pairing_mode == "UNPAIRED_PFT_SAMPLE") &
-      !any(conversion_classes == "USER_SUPPLIED_MODEL") &
-      is.finite(unpaired_sdlog) & unpaired_sdlog > 0
-    if (add_unpaired_noise) {
-      positive <- is.finite(value) & value > 0
-      value[positive] <- value[positive] * exp(stats::rnorm(
-        sum(positive),
-        mean = -0.5 * unpaired_sdlog^2,
-        sd = unpaired_sdlog
-      ))
-    }
-
-    valid <- .prema_target_domain_valid(target, value)
-    source_text <- if (nrow(successful_attempts) > 0L) {
-      paste(unique(successful_attempts$source_traits), collapse = "|")
     } else {
-      paste(available, collapse = "|")
+      data.table::data.table()
     }
-    formula_text <- if (nrow(successful_attempts) > 0L) {
-      paste(unique(successful_attempts$formula), collapse = " | ")
+    if (nrow(candidate_table) > 0L) {
+      n_candidate <- nrow(candidate_table)
+      n_invalid_domain <- sum(!candidate_table$domain_valid)
+      candidate_table <- candidate_table[domain_valid == TRUE]
+      n_valid_before_dedup <- nrow(candidate_table)
+      candidate_table[, observation_dedup_key__ :=
+        .prema_observation_dedup_key(.SD)]
+      data.table::setorder(
+        candidate_table,
+        route_priority,
+        anchor_source,
+        source_observation_id
+      )
+      candidate_table <- candidate_table[
+        !duplicated(observation_dedup_key__)
+      ]
+      candidate_table[, observation_dedup_key__ := NULL]
     } else {
-      "No successful route"
+      n_candidate <- 0L
+      n_invalid_domain <- 0L
+      n_valid_before_dedup <- 0L
     }
 
-    out <- data.table::data.table(
-      pecan_trait = target,
-      target_value = value,
-      target_unit = target_unit,
-      source_class = conversion_class,
-      source_traits = source_text,
-      conversion_formula = formula_text,
-      pairing_mode = pairing_mode,
-      uses_default_context = TRUE,
-      proxy_sdlog = if (add_unpaired_noise) unpaired_sdlog else NA_real_,
-      source_observation_id = base_meta$source_observation_id,
-      species_key = base_meta$species_key,
-      species_name = base_meta$species_name,
-      dataset_key = base_meta$dataset_key,
-      reference_key = base_meta$reference_key,
-      latitude = base_meta$latitude,
-      longitude = base_meta$longitude,
-      replicates = ifelse(
-        pairing_mode %in% c("PRIMARY_SOURCE", "SAME_OBSERVATION_ID"),
-        base_meta$replicates,
-        1
-      ),
-      date = base_meta$date,
-      time = base_meta$time,
-      domain_valid = valid
+    n_valid <- nrow(candidate_table)
+    has_direct <- n_valid > 0L && any(
+      candidate_table$source_class == "DIRECT_OBSERVED"
     )
-    observation_results[[target_index]] <- out[domain_valid == TRUE]
+    has_derived <- n_valid > 0L && any(
+      candidate_table$source_class != "DIRECT_OBSERVED"
+    )
+    target_status <- if (has_direct && has_derived) {
+      "READY_FOR_MA_DIRECT_AND_DERIVED"
+    } else if (has_direct) {
+      "DIRECT_OBSERVED"
+    } else if (has_derived) {
+      "READY_FOR_MA_MULTI_ROUTE"
+    } else if (nrow(direct) == 0L && length(available) == 0L) {
+      "DEFAULT_ONLY_NO_TRY_SOURCE"
+    } else {
+      "DEFAULT_ONLY_NO_VALID_CONVERSION"
+    }
+
+    observation_results[[target_index]] <- candidate_table
     target_audit[[target_index]] <- data.table::data.table(
       pecan_trait = target,
       target_unit = target_unit,
-      target_status = if (any(valid)) {
-        "READY_FOR_MA"
+      target_status = target_status,
+      primary_source = if (n_valid > 0L) {
+        sources_used <- unique(candidate_table$anchor_source)
+        if (length(sources_used) == 1L) sources_used[[1L]] else "MULTI_ROUTE"
       } else {
-        "DEFAULT_ONLY_NO_VALID_CONVERSION"
+        ""
       },
-      primary_source = primary_source,
-      available_sources = paste(available, collapse = "|"),
-      n_candidate = length(value),
-      n_valid = sum(valid),
-      n_invalid_domain = sum(is.finite(value) & !valid),
-      source_class = if (any(valid)) conversion_class else "DEFAULT_ONLY",
-      pairing_modes = paste(sort(unique(pairing_mode)), collapse = "|")
+      available_sources = paste(
+        unique(c(if (nrow(direct) > 0L) target else character(), available)),
+        collapse = "|"
+      ),
+      route_sources_used = if (n_valid > 0L) {
+        paste(unique(candidate_table$anchor_source), collapse = "|")
+      } else {
+        ""
+      },
+      n_candidate = n_candidate,
+      n_valid_before_dedup = n_valid_before_dedup,
+      n_deduplicated_same_observation = n_valid_before_dedup - n_valid,
+      n_valid = n_valid,
+      n_invalid_domain = n_invalid_domain,
+      source_class = if (n_valid > 0L) {
+        paste(sort(unique(candidate_table$source_class)), collapse = "|")
+      } else {
+        "DEFAULT_ONLY"
+      },
+      pairing_modes = if (n_valid > 0L) {
+        paste(sort(unique(candidate_table$pairing_mode)), collapse = "|")
+      } else {
+        ""
+      }
     )
-    rule_audit[[target_index]] <- bridge_run$attempts[
-      target_pecan_trait == target
-    ]
+    rule_audit[[target_index]] <- if (length(target_rules) > 0L) {
+      data.table::rbindlist(
+        target_rules,
+        use.names = TRUE,
+        fill = TRUE
+      )
+    } else {
+      data.table::data.table()
+    }
   }
 
   observations <- data.table::rbindlist(
@@ -1575,6 +1816,8 @@ run_prema_pecan_trait_ma <- function(
     output_dir,
     pftspecies_rdata,
     trydat_use_species_rdata,
+    pft_coordinate_map_file,
+    observation_coordinate_file = NULL,
     iterations = 3000L,
     workers = 2L,
     n_output_draws = 1000L,
@@ -1584,6 +1827,7 @@ run_prema_pecan_trait_ma <- function(
     include_site_variability_in_samples = TRUE,
     sample_mode = c("new_site_predictive", "global_mean"),
     unsupported_unit_action = c("stop", "drop"),
+    max_pft_distance_km = 250,
     resume = TRUE
 ) {
   .prema_require_packages(c(
@@ -1595,7 +1839,9 @@ run_prema_pecan_trait_ma <- function(
     "make_trait_data_from_try_ma_long",
     "make_prior_distns_from_trait_data",
     "run_pecan_ma_parallel",
-    "qc_pecan_ma_result"
+    "qc_pecan_ma_result",
+    "attach_try_observation_coordinates",
+    "assign_try_observations_to_pft"
   ))
   sample_mode <- match.arg(sample_mode)
   unsupported_unit_action <- match.arg(unsupported_unit_action)
@@ -1632,14 +1878,41 @@ run_prema_pecan_trait_ma <- function(
     trydat_use_species_rdata,
     c("trydat_use_species", "trydat", "try_data")
   )
+  pft_coordinate_map <- load_prema_table(
+    pft_coordinate_map_file,
+    c("pft_coordinate_map", "final_pft_sites", "pft_sites")
+  )
+  observation_coordinate_data <- NULL
+  observation_coordinate_path_provided <-
+    !is.null(observation_coordinate_file) &&
+    length(observation_coordinate_file) == 1L &&
+    !is.na(observation_coordinate_file) &&
+    nzchar(trimws(observation_coordinate_file))
+  if (observation_coordinate_path_provided) {
+    observation_coordinate_data <- load_prema_table(
+      observation_coordinate_file,
+      c("observation_coordinates", "try_observation_coordinates")
+    )
+  }
 
   selected_try <- select_prema_pft_observations(
     trydat_use_species = trydat_use_species,
     pftspecies = pftspecies,
-    pft_name = pft_name
+    pft_name = pft_name,
+    pft_coordinate_map = pft_coordinate_map,
+    observation_coordinate_data = observation_coordinate_data,
+    max_distance_km = max_pft_distance_km
   )
   pft_selection_audit <- attr(selected_try, "pft_selection_audit")
   excluded_ambiguous_rows <- attr(selected_try, "excluded_ambiguous_rows")
+  observation_pft_assignment_audit <- attr(
+    selected_try,
+    "observation_pft_assignment_audit"
+  )
+  observation_coordinate_join_audit <- attr(
+    selected_try,
+    "observation_coordinate_join_audit"
+  )
   if ("ErrorRisk" %in% names(selected_try)) {
     selected_try[, ErrorRisk_original_prema := ErrorRisk]
     selected_try[, ErrorRisk := NULL]
@@ -1667,6 +1940,14 @@ run_prema_pecan_trait_ma <- function(
   data.table::fwrite(
     excluded_ambiguous_rows,
     file.path(canonical_dir, "excluded_ambiguous_rows.csv")
+  )
+  data.table::fwrite(
+    observation_pft_assignment_audit,
+    file.path(canonical_dir, "observation_pft_assignment_audit.csv")
+  )
+  data.table::fwrite(
+    observation_coordinate_join_audit,
+    file.path(canonical_dir, "observation_coordinate_join_audit.csv")
   )
   data.table::fwrite(
     unit_conversion_audit,
@@ -1825,8 +2106,20 @@ run_prema_pecan_trait_ma <- function(
     output_dir = output_dir,
     random_effects = TRUE,
     sample_mode = sample_mode,
+    n_selected_unique_species_rows =
+      pft_selection_audit$selected_unique_species_rows,
+    n_selected_spatial_rows = pft_selection_audit$selected_spatial_rows,
+    n_unassigned_pft_candidate_rows =
+      pft_selection_audit$excluded_unassigned_candidate_rows,
     n_canonical_try_rows = nrow(canonical_try),
     n_prema_target_rows = nrow(target_result$observations),
+    n_targets_using_multiple_routes = target_result$target_audit[
+      primary_source == "MULTI_ROUTE", .N
+    ],
+    n_target_rows_deduplicated = sum(
+      target_result$target_audit$n_deduplicated_same_observation,
+      na.rm = TRUE
+    ),
     n_targets_entering_ma = length(ma_traits),
     n_ma_qc_pass = length(ma_qc$passed_traits),
     n_ma_qc_review = length(ma_qc$review_traits),
@@ -1856,6 +2149,18 @@ run_prema_pecan_trait_ma <- function(
         trydat_use_species_rdata,
         mustWork = TRUE
       ),
+      pft_coordinate_map_file = normalizePath(
+        pft_coordinate_map_file,
+        mustWork = TRUE
+      ),
+      observation_coordinate_file = if (
+        !observation_coordinate_path_provided
+      ) {
+        NA_character_
+      } else {
+        normalizePath(observation_coordinate_file, mustWork = TRUE)
+      },
+      max_pft_distance_km = as.numeric(max_pft_distance_km),
       iterations = as.integer(iterations),
       workers = as.integer(workers),
       random = TRUE,
@@ -1865,6 +2170,8 @@ run_prema_pecan_trait_ma <- function(
       seed = as.integer(seed)
     ),
     pft_selection_audit = pft_selection_audit,
+    observation_pft_assignment_audit = observation_pft_assignment_audit,
+    observation_coordinate_join_audit = observation_coordinate_join_audit,
     target_audit = target_result$target_audit,
     ma_result = ma_result,
     ma_qc = ma_qc,
