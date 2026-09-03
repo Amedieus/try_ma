@@ -1,6 +1,6 @@
 options(stringsAsFactors = FALSE)
 
-PREMA_PECAN_PIPELINE_VERSION <- "2026-09-03.3"
+PREMA_PECAN_PIPELINE_VERSION <- "2026-09-03.4"
 
 
 # =============================================================================
@@ -318,25 +318,45 @@ load_prema_table <- function(path, preferred_names = character()) {
 }
 
 
-# Reuse the repository's observation-level spatial assignment. Species that
-# occur in one PFT inherit that PFT. For species mapped to multiple PFTs, each
-# TRY observation is assigned to the nearest reference point among only that
-# species' candidate PFTs. Every observation therefore enters at most one PFT.
+# Select TRY observations for one target PFT using one of two explicit rules.
+#
+# `share_species` (default): species membership is the inclusion rule. Every
+# TRY observation belonging to a species listed for the target PFT is retained,
+# even when that species is also listed for other PFTs. Coordinates and the
+# 250-km threshold are deliberately ignored in this mode.
+#
+# `spatial_observation`: preserve the optional older rule. Ambiguous-species
+# observations are assigned to the nearest candidate-PFT reference point and
+# may be excluded for missing coordinates or excessive distance.
 select_prema_pft_observations <- function(
     trydat_use_species,
     pftspecies,
     pft_name,
-    pft_coordinate_map,
+    pft_coordinate_map = NULL,
+    assignment_mode = c("share_species", "spatial_observation"),
     observation_coordinate_data = NULL,
     observation_lat_col = "Latitude",
     observation_lon_col = "Longitude",
     max_distance_km = 250
 ) {
   .prema_require_packages("data.table")
-  .prema_require_functions(c(
-    "attach_try_observation_coordinates",
-    "assign_try_observations_to_pft"
-  ))
+  assignment_mode <- match.arg(assignment_mode)
+  pft_name <- trimws(as.character(pft_name))
+  if (length(pft_name) != 1L || is.na(pft_name) || !nzchar(pft_name)) {
+    stop("pft_name must be one non-empty string.", call. = FALSE)
+  }
+  if (identical(assignment_mode, "spatial_observation")) {
+    .prema_require_functions(c(
+      "attach_try_observation_coordinates",
+      "assign_try_observations_to_pft"
+    ))
+    if (is.null(pft_coordinate_map)) {
+      stop(
+        "pft_coordinate_map is required for spatial_observation mode.",
+        call. = FALSE
+      )
+    }
+  }
   try_dt <- data.table::copy(data.table::as.data.table(trydat_use_species))
   pft_dt <- data.table::copy(data.table::as.data.table(pftspecies))
 
@@ -407,13 +427,106 @@ select_prema_pft_observations <- function(
   candidates <- data.table::copy(
     try_dt[species_key_prema__ %in% target_species]
   )
-  candidates[, species_key_prema__ := NULL]
   if (nrow(candidates) == 0L) {
     stop(
       "No TRY rows belong to species that are candidates for PFT `",
       pft_name, "`.",
       call. = FALSE
     )
+  }
+
+  species_membership <- pft_dt[
+    ,
+    .(
+      pft_candidate_count = data.table::uniqueN(pft_key__),
+      pft_candidate_names = paste(
+        sort(unique(pft_key__)),
+        collapse = " | "
+      )
+    ),
+    by = species_key__
+  ]
+  candidates[
+    species_membership,
+    on = .(species_key_prema__ = species_key__),
+    `:=`(
+      pft_candidate_count = i.pft_candidate_count,
+      pft_candidate_names = i.pft_candidate_names
+    )
+  ]
+  candidates[, shared_across_pfts := pft_candidate_count > 1L]
+  candidates[, species_key_prema__ := NULL]
+
+  if (identical(assignment_mode, "share_species")) {
+    candidates[, `:=`(
+      assigned_final_pft = pft_name,
+      pft_assignment_method = data.table::fifelse(
+        shared_across_pfts,
+        "shared_species_membership",
+        "unique_species_pft"
+      ),
+      pft_assignment_distance_km = NA_real_,
+      pft_assignment_status = "ASSIGNED"
+    )]
+    candidates[, final_pft := pft_name]
+    candidates[, pft_assignment_method_prema := pft_assignment_method]
+
+    assignment_audit <- candidates[
+      ,
+      .(
+        n_observations = .N,
+        n_species = data.table::uniqueN(
+          trimws(as.character(AccSpeciesID))
+        )
+      ),
+      by = .(
+        pft_assignment_status,
+        pft_assignment_method,
+        assigned_final_pft
+      )
+    ]
+    unassigned <- candidates[0]
+    coordinate_join_audit <- data.table::data.table(
+      coordinate_usage = "NOT_USED_SHARE_SPECIES",
+      n_try_rows = nrow(candidates),
+      n_valid_coordinates_before_join = NA_integer_,
+      n_coordinates_filled_from_lookup = 0L,
+      n_valid_coordinates_after_join = NA_integer_,
+      n_rows_still_without_valid_coordinates = NA_integer_
+    )
+    assignment_configuration <- list(
+      assignment_mode = assignment_mode,
+      coordinates_used = FALSE,
+      max_distance_km = NA_real_
+    )
+    audit <- data.table::data.table(
+      pft = pft_name,
+      assignment_mode = assignment_mode,
+      input_try_rows = input_try_rows,
+      target_candidate_species = length(target_species),
+      target_candidate_rows = nrow(candidates),
+      selected_rows = nrow(candidates),
+      selected_unique_species_rows = candidates[
+        shared_across_pfts == FALSE, .N
+      ],
+      selected_shared_species_rows = candidates[
+        shared_across_pfts == TRUE, .N
+      ],
+      selected_spatial_rows = 0L,
+      excluded_ambiguous_rows = 0L,
+      excluded_unassigned_candidate_rows = 0L,
+      max_distance_km = NA_real_
+    )
+
+    attr(candidates, "pft_selection_audit") <- audit
+    attr(candidates, "excluded_ambiguous_rows") <- unassigned
+    attr(candidates, "observation_pft_assignment_audit") <-
+      assignment_audit
+    attr(candidates, "observation_pft_assignment_configuration") <-
+      assignment_configuration
+    attr(candidates, "observation_coordinate_join_audit") <-
+      coordinate_join_audit
+    return(candidates[])
   }
 
   coordinate_columns_present <- all(
@@ -507,6 +620,7 @@ select_prema_pft_observations <- function(
 
   audit <- data.table::data.table(
     pft = pft_name,
+    assignment_mode = assignment_mode,
     input_try_rows = input_try_rows,
     target_candidate_species = length(target_species),
     target_candidate_rows = nrow(candidates),
@@ -514,6 +628,7 @@ select_prema_pft_observations <- function(
     selected_unique_species_rows = selected[
       pft_assignment_method == "unique_species_pft", .N
     ],
+    selected_shared_species_rows = 0L,
     selected_spatial_rows = selected[
       pft_assignment_method == "nearest_candidate_pft_coordinate", .N
     ],
@@ -1816,7 +1931,8 @@ run_prema_pecan_trait_ma <- function(
     output_dir,
     pftspecies_rdata,
     trydat_use_species_rdata,
-    pft_coordinate_map_file,
+    pft_coordinate_map_file = NULL,
+    pft_assignment_mode = c("share_species", "spatial_observation"),
     observation_coordinate_file = NULL,
     observation_coordinate_data = NULL,
     iterations = 3000L,
@@ -1845,6 +1961,7 @@ run_prema_pecan_trait_ma <- function(
     "assign_try_observations_to_pft"
   ))
   sample_mode <- match.arg(sample_mode)
+  pft_assignment_mode <- match.arg(pft_assignment_mode)
   unsupported_unit_action <- match.arg(unsupported_unit_action)
   if (!isTRUE(random)) {
     stop(
@@ -1879,13 +1996,35 @@ run_prema_pecan_trait_ma <- function(
     trydat_use_species_rdata,
     c("trydat_use_species", "trydat", "try_data")
   )
-  pft_coordinate_map <- load_prema_table(
-    pft_coordinate_map_file,
-    c("pft_coordinate_map", "final_pft_sites", "pft_sites")
-  )
+  pft_coordinate_path_provided <-
+    !is.null(pft_coordinate_map_file) &&
+    length(pft_coordinate_map_file) == 1L &&
+    !is.na(pft_coordinate_map_file) &&
+    nzchar(trimws(pft_coordinate_map_file))
+  if (
+    identical(pft_assignment_mode, "spatial_observation") &&
+    !pft_coordinate_path_provided
+  ) {
+    stop(
+      "pft_coordinate_map_file is required for spatial_observation mode.",
+      call. = FALSE
+    )
+  }
+  pft_coordinate_map <- if (
+    identical(pft_assignment_mode, "spatial_observation")
+  ) {
+    load_prema_table(
+      pft_coordinate_map_file,
+      c("pft_coordinate_map", "final_pft_sites", "pft_sites")
+    )
+  } else {
+    NULL
+  }
   observation_coordinate_data_provided <-
+    identical(pft_assignment_mode, "spatial_observation") &&
     !is.null(observation_coordinate_data)
   observation_coordinate_path_provided <-
+    identical(pft_assignment_mode, "spatial_observation") &&
     !observation_coordinate_data_provided &&
     !is.null(observation_coordinate_file) &&
     length(observation_coordinate_file) == 1L &&
@@ -1913,6 +2052,7 @@ run_prema_pecan_trait_ma <- function(
     pftspecies = pftspecies,
     pft_name = pft_name,
     pft_coordinate_map = pft_coordinate_map,
+    assignment_mode = pft_assignment_mode,
     observation_coordinate_data = observation_coordinate_data,
     max_distance_km = max_pft_distance_km
   )
@@ -2119,8 +2259,11 @@ run_prema_pecan_trait_ma <- function(
     output_dir = output_dir,
     random_effects = TRUE,
     sample_mode = sample_mode,
+    pft_assignment_mode = pft_assignment_mode,
     n_selected_unique_species_rows =
       pft_selection_audit$selected_unique_species_rows,
+    n_selected_shared_species_rows =
+      pft_selection_audit$selected_shared_species_rows,
     n_selected_spatial_rows = pft_selection_audit$selected_spatial_rows,
     n_unassigned_pft_candidate_rows =
       pft_selection_audit$excluded_unassigned_candidate_rows,
@@ -2162,10 +2305,14 @@ run_prema_pecan_trait_ma <- function(
         trydat_use_species_rdata,
         mustWork = TRUE
       ),
-      pft_coordinate_map_file = normalizePath(
-        pft_coordinate_map_file,
-        mustWork = TRUE
-      ),
+      pft_assignment_mode = pft_assignment_mode,
+      pft_coordinate_map_file = if (
+        identical(pft_assignment_mode, "spatial_observation")
+      ) {
+        normalizePath(pft_coordinate_map_file, mustWork = TRUE)
+      } else {
+        NA_character_
+      },
       observation_coordinate_file = if (
         !observation_coordinate_path_provided
       ) {
@@ -2174,15 +2321,23 @@ run_prema_pecan_trait_ma <- function(
         normalizePath(observation_coordinate_file, mustWork = TRUE)
       },
       observation_coordinate_source = if (
-        observation_coordinate_data_provided
+        identical(pft_assignment_mode, "share_species")
       ) {
+        "NOT_USED_SHARE_SPECIES"
+      } else if (observation_coordinate_data_provided) {
         "IN_MEMORY_R_OBJECT"
       } else if (observation_coordinate_path_provided) {
         "FILE"
       } else {
         "TRY_INPUT_COLUMNS_ONLY"
       },
-      max_pft_distance_km = as.numeric(max_pft_distance_km),
+      max_pft_distance_km = if (
+        identical(pft_assignment_mode, "spatial_observation")
+      ) {
+        as.numeric(max_pft_distance_km)
+      } else {
+        NA_real_
+      },
       iterations = as.integer(iterations),
       workers = as.integer(workers),
       random = TRUE,
@@ -2211,6 +2366,9 @@ run_prema_pecan_trait_ma <- function(
   message(
     "\nPre-MA PEcAn-target pipeline complete.",
     "\nPFT: ", pft_name,
+    "\nPFT assignment mode: ", pft_assignment_mode,
+    "\nShared-species TRY rows retained: ",
+    pipeline_summary$n_selected_shared_species_rows,
     "\nTargets entering random-effect MA: ", length(ma_traits),
     "\nQC PASS: ", length(ma_qc$passed_traits),
     "\nTargets using sd.site in new-site draws: ",

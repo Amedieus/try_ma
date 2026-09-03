@@ -51,6 +51,7 @@ selected_test <- select_prema_pft_observations(
   pftspecies = species_map_test,
   pft_name = "PFT_A",
   pft_coordinate_map = pft_coordinate_test,
+  assignment_mode = "spatial_observation",
   observation_coordinate_data = observation_coordinate_test,
   max_distance_km = 250
 )
@@ -66,6 +67,55 @@ stopifnot(
   selection_audit_test$selected_spatial_rows == 1L,
   selection_audit_test$excluded_unassigned_candidate_rows == 1L,
   unassigned_test$ObservationID == 104L
+)
+
+
+# ---------------------------------------------------------------------------
+# Default species-sharing mode keeps every observation of a target-PFT species.
+# Coordinates and distance are irrelevant; ambiguous species are deliberately
+# reused across their candidate PFT analyses rather than discarded.
+# ---------------------------------------------------------------------------
+
+shared_test <- select_prema_pft_observations(
+  trydat_use_species = try_test,
+  pftspecies = species_map_test,
+  pft_name = "PFT_A",
+  pft_coordinate_map = NULL,
+  assignment_mode = "share_species",
+  observation_coordinate_data = NULL,
+  max_distance_km = 250
+)
+
+shared_audit_test <- attr(shared_test, "pft_selection_audit")
+shared_unassigned_test <- attr(shared_test, "excluded_ambiguous_rows")
+
+stopifnot(
+  identical(sort(shared_test$ObservationID), 101:104),
+  all(
+    shared_test[
+      AccSpeciesID == "ambiguous",
+      pft_assignment_method
+    ] == "shared_species_membership"
+  ),
+  all(shared_test$assigned_final_pft == "PFT_A"),
+  shared_audit_test$selected_unique_species_rows == 1L,
+  shared_audit_test$selected_shared_species_rows == 3L,
+  shared_audit_test$selected_spatial_rows == 0L,
+  shared_audit_test$excluded_unassigned_candidate_rows == 0L,
+  nrow(shared_unassigned_test) == 0L
+)
+
+shared_b_test <- select_prema_pft_observations(
+  trydat_use_species = try_test,
+  pftspecies = species_map_test,
+  pft_name = "PFT_B",
+  assignment_mode = "share_species"
+)
+
+stopifnot(
+  identical(sort(shared_b_test$ObservationID), 102:104),
+  all(shared_b_test$pft_assignment_method == "shared_species_membership"),
+  all(shared_b_test$assigned_final_pft == "PFT_B")
 )
 
 
