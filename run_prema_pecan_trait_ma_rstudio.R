@@ -38,9 +38,10 @@ PFT_COORDINATE_MAP_FILE <- paste0(
   "final_8000_sites_with_final_pft_v4.csv"
 )
 
-# Set to NA_character_ only when trydat_use_species already contains usable
-# Latitude and Longitude columns. Otherwise this should be the table saved from
-# na_species_res$observation_coordinates.
+# This optional file is only one possible coordinate source. The caller first
+# checks the current RStudio session for `try_observation_coordinates` or
+# `na_species_res$observation_coordinates`, then this file, and finally the
+# Latitude/Longitude columns already present in trydat_use_species.
 TRY_OBSERVATION_COORDINATE_FILE <- file.path(
   "/projectnb/dietzelab/guYANG/TRY_meta_analysis",
   "try_observation_coordinates.rds"
@@ -151,15 +152,73 @@ for (input_file in required_input_files) {
     stop("Cannot find required input file: ", input_file, call. = FALSE)
   }
 }
+
+# Prefer an observation-coordinate table that already exists in this RStudio
+# session. This is useful immediately after the PFT mapping code has produced
+# `na_species_res$observation_coordinates`; saving an intermediate RDS is then
+# optional.
+TRY_OBSERVATION_COORDINATE_DATA <- NULL
+TRY_OBSERVATION_COORDINATE_SOURCE <- "TRY_INPUT_COLUMNS_ONLY"
+
 if (
+  exists(
+    "try_observation_coordinates",
+    envir = .GlobalEnv,
+    inherits = FALSE
+  )
+) {
+  TRY_OBSERVATION_COORDINATE_DATA <- get(
+    "try_observation_coordinates",
+    envir = .GlobalEnv,
+    inherits = FALSE
+  )
+  TRY_OBSERVATION_COORDINATE_SOURCE <-
+    "R_OBJECT:try_observation_coordinates"
+} else if (
+  exists("na_species_res", envir = .GlobalEnv, inherits = FALSE)
+) {
+  na_species_res_current <- get(
+    "na_species_res",
+    envir = .GlobalEnv,
+    inherits = FALSE
+  )
+  if (
+    is.list(na_species_res_current) &&
+    !is.null(na_species_res_current$observation_coordinates)
+  ) {
+    TRY_OBSERVATION_COORDINATE_DATA <-
+      na_species_res_current$observation_coordinates
+    TRY_OBSERVATION_COORDINATE_SOURCE <-
+      "R_OBJECT:na_species_res$observation_coordinates"
+  }
+}
+
+TRY_OBSERVATION_COORDINATE_FILE_USE <- NULL
+coordinate_file_requested <-
+  length(TRY_OBSERVATION_COORDINATE_FILE) == 1L &&
   !is.na(TRY_OBSERVATION_COORDINATE_FILE) &&
-  nzchar(trimws(TRY_OBSERVATION_COORDINATE_FILE)) &&
+  nzchar(trimws(TRY_OBSERVATION_COORDINATE_FILE))
+
+if (is.null(TRY_OBSERVATION_COORDINATE_DATA) &&
+    coordinate_file_requested &&
+    file.exists(TRY_OBSERVATION_COORDINATE_FILE)) {
+  TRY_OBSERVATION_COORDINATE_FILE_USE <-
+    TRY_OBSERVATION_COORDINATE_FILE
+  TRY_OBSERVATION_COORDINATE_SOURCE <- paste0(
+    "FILE:",
+    TRY_OBSERVATION_COORDINATE_FILE
+  )
+} else if (
+  is.null(TRY_OBSERVATION_COORDINATE_DATA) &&
+  coordinate_file_requested &&
   !file.exists(TRY_OBSERVATION_COORDINATE_FILE)
 ) {
-  stop(
-    "Cannot find TRY observation coordinate file: ",
+  message(
+    "Optional coordinate file was not found: ",
     TRY_OBSERVATION_COORDINATE_FILE,
-    call. = FALSE
+    "\nThe pipeline will check TRY's own Latitude/Longitude columns. ",
+    "Ambiguous observations still lacking coordinates will be excluded ",
+    "and audited; the run stops only if no target-PFT observations remain."
   )
 }
 
@@ -173,6 +232,8 @@ message("PFT: ", PFT_NAME)
 message("Output: ", OUTPUT_DIR)
 message("Random site effects: TRUE")
 message("PEcAn export mode: ", PECAN_SAMPLE_MODE)
+message("TRY observation coordinate source: ",
+        TRY_OBSERVATION_COORDINATE_SOURCE)
 message("No pecan.xml will be read.")
 message("============================================================")
 
@@ -182,7 +243,8 @@ prema_result <- run_prema_pecan_trait_ma(
   pftspecies_rdata = PFTSPECIES_RDATA,
   trydat_use_species_rdata = TRYDAT_USE_SPECIES_RDATA,
   pft_coordinate_map_file = PFT_COORDINATE_MAP_FILE,
-  observation_coordinate_file = TRY_OBSERVATION_COORDINATE_FILE,
+  observation_coordinate_file = TRY_OBSERVATION_COORDINATE_FILE_USE,
+  observation_coordinate_data = TRY_OBSERVATION_COORDINATE_DATA,
   iterations = MA_ITERATIONS,
   workers = MA_WORKERS,
   n_output_draws = N_OUTPUT_DRAWS,
