@@ -13,10 +13,16 @@ options(stringsAsFactors = FALSE)
 PFT_NAME <- "Evergreen_Broadleaf_Forest"
 PFT_NAME <- trimws(PFT_NAME)
 
+# Default: select by species membership only. All TRY observations from a
+# species listed for this PFT are retained, even if the species is shared with
+# other PFTs, coordinates are missing, or the nearest reference point is more
+# than 250 km away.
+PFT_ASSIGNMENT_MODE <- "share_species"
+
 OUTPUT_DIR <- file.path(
   "/projectnb/dietzelab/guYANG/TRY_meta_analysis",
   PFT_NAME,
-  "prema_pecan_random_site"
+  paste0("prema_pecan_random_site_", PFT_ASSIGNMENT_MODE)
 )
 
 PFTSPECIES_RDATA <- paste0(
@@ -29,19 +35,15 @@ TRYDAT_USE_SPECIES_RDATA <- paste0(
   "trydat_use_species.RData"
 )
 
-# Reference sites carrying final_pft plus latitude/longitude. Ambiguous TRY
-# species are assigned observation-by-observation to the nearest reference
-# point among that species' candidate PFTs.
+# Optional legacy mode: set PFT_ASSIGNMENT_MODE to "spatial_observation" to
+# assign ambiguous-species observations using the reference-point file below.
 PFT_COORDINATE_MAP_FILE <- paste0(
   "/projectnb/dietzelab/guYANG/",
   "SIPNET_Model_Calibration/Final_PFT_assignment_v4/",
   "final_8000_sites_with_final_pft_v4.csv"
 )
 
-# This optional file is only one possible coordinate source. The caller first
-# checks the current RStudio session for `try_observation_coordinates` or
-# `na_species_res$observation_coordinates`, then this file, and finally the
-# Latitude/Longitude columns already present in trydat_use_species.
+# Used only in spatial_observation mode. It is ignored in share_species mode.
 TRY_OBSERVATION_COORDINATE_FILE <- file.path(
   "/projectnb/dietzelab/guYANG/TRY_meta_analysis",
   "try_observation_coordinates.rds"
@@ -56,6 +58,8 @@ MA_ITERATIONS <- 3000L
 MA_WORKERS <- 2L
 N_OUTPUT_DRAWS <- 1000L
 RANDOM_SEED <- 20260903L
+# Safe because OUTPUT_DIR includes PFT_ASSIGNMENT_MODE, so spatial-selection
+# checkpoints cannot be reused accidentally by a share-species run.
 RESUME_EXISTING_TRAIT_RUNS <- TRUE
 PFT_MAX_DISTANCE_KM <- 250
 
@@ -142,54 +146,65 @@ if (length(PFT_NAME) != 1L || is.na(PFT_NAME) || !nzchar(trimws(PFT_NAME))) {
 if (length(OUTPUT_DIR) != 1L || is.na(OUTPUT_DIR) || !nzchar(OUTPUT_DIR)) {
   stop("OUTPUT_DIR must be one non-empty path.", call. = FALSE)
 }
+if (!PFT_ASSIGNMENT_MODE %in% c("share_species", "spatial_observation")) {
+  stop(
+    "PFT_ASSIGNMENT_MODE must be share_species or spatial_observation.",
+    call. = FALSE
+  )
+}
 required_input_files <- c(
   PFTSPECIES_RDATA,
-  TRYDAT_USE_SPECIES_RDATA,
-  PFT_COORDINATE_MAP_FILE
+  TRYDAT_USE_SPECIES_RDATA
 )
+if (identical(PFT_ASSIGNMENT_MODE, "spatial_observation")) {
+  required_input_files <- c(
+    required_input_files,
+    PFT_COORDINATE_MAP_FILE
+  )
+}
 for (input_file in required_input_files) {
   if (!file.exists(input_file)) {
     stop("Cannot find required input file: ", input_file, call. = FALSE)
   }
 }
 
-# Prefer an observation-coordinate table that already exists in this RStudio
-# session. This is useful immediately after the PFT mapping code has produced
-# `na_species_res$observation_coordinates`; saving an intermediate RDS is then
-# optional.
+# Coordinates are intentionally unused in share_species mode.
 TRY_OBSERVATION_COORDINATE_DATA <- NULL
-TRY_OBSERVATION_COORDINATE_SOURCE <- "TRY_INPUT_COLUMNS_ONLY"
+TRY_OBSERVATION_COORDINATE_SOURCE <- "NOT_USED_SHARE_SPECIES"
 
-if (
-  exists(
-    "try_observation_coordinates",
-    envir = .GlobalEnv,
-    inherits = FALSE
-  )
-) {
-  TRY_OBSERVATION_COORDINATE_DATA <- get(
-    "try_observation_coordinates",
-    envir = .GlobalEnv,
-    inherits = FALSE
-  )
-  TRY_OBSERVATION_COORDINATE_SOURCE <-
-    "R_OBJECT:try_observation_coordinates"
-} else if (
-  exists("na_species_res", envir = .GlobalEnv, inherits = FALSE)
-) {
-  na_species_res_current <- get(
-    "na_species_res",
-    envir = .GlobalEnv,
-    inherits = FALSE
-  )
+if (identical(PFT_ASSIGNMENT_MODE, "spatial_observation")) {
+  TRY_OBSERVATION_COORDINATE_SOURCE <- "TRY_INPUT_COLUMNS_ONLY"
   if (
-    is.list(na_species_res_current) &&
-    !is.null(na_species_res_current$observation_coordinates)
+    exists(
+      "try_observation_coordinates",
+      envir = .GlobalEnv,
+      inherits = FALSE
+    )
   ) {
-    TRY_OBSERVATION_COORDINATE_DATA <-
-      na_species_res_current$observation_coordinates
+    TRY_OBSERVATION_COORDINATE_DATA <- get(
+      "try_observation_coordinates",
+      envir = .GlobalEnv,
+      inherits = FALSE
+    )
     TRY_OBSERVATION_COORDINATE_SOURCE <-
-      "R_OBJECT:na_species_res$observation_coordinates"
+      "R_OBJECT:try_observation_coordinates"
+  } else if (
+    exists("na_species_res", envir = .GlobalEnv, inherits = FALSE)
+  ) {
+    na_species_res_current <- get(
+      "na_species_res",
+      envir = .GlobalEnv,
+      inherits = FALSE
+    )
+    if (
+      is.list(na_species_res_current) &&
+      !is.null(na_species_res_current$observation_coordinates)
+    ) {
+      TRY_OBSERVATION_COORDINATE_DATA <-
+        na_species_res_current$observation_coordinates
+      TRY_OBSERVATION_COORDINATE_SOURCE <-
+        "R_OBJECT:na_species_res$observation_coordinates"
+    }
   }
 }
 
@@ -199,7 +214,8 @@ coordinate_file_requested <-
   !is.na(TRY_OBSERVATION_COORDINATE_FILE) &&
   nzchar(trimws(TRY_OBSERVATION_COORDINATE_FILE))
 
-if (is.null(TRY_OBSERVATION_COORDINATE_DATA) &&
+if (identical(PFT_ASSIGNMENT_MODE, "spatial_observation") &&
+    is.null(TRY_OBSERVATION_COORDINATE_DATA) &&
     coordinate_file_requested &&
     file.exists(TRY_OBSERVATION_COORDINATE_FILE)) {
   TRY_OBSERVATION_COORDINATE_FILE_USE <-
@@ -209,6 +225,7 @@ if (is.null(TRY_OBSERVATION_COORDINATE_DATA) &&
     TRY_OBSERVATION_COORDINATE_FILE
   )
 } else if (
+  identical(PFT_ASSIGNMENT_MODE, "spatial_observation") &&
   is.null(TRY_OBSERVATION_COORDINATE_DATA) &&
   coordinate_file_requested &&
   !file.exists(TRY_OBSERVATION_COORDINATE_FILE)
@@ -230,6 +247,7 @@ if (is.null(TRY_OBSERVATION_COORDINATE_DATA) &&
 message("============================================================")
 message("PFT: ", PFT_NAME)
 message("Output: ", OUTPUT_DIR)
+message("PFT assignment mode: ", PFT_ASSIGNMENT_MODE)
 message("Random site effects: TRUE")
 message("PEcAn export mode: ", PECAN_SAMPLE_MODE)
 message("TRY observation coordinate source: ",
@@ -242,7 +260,10 @@ prema_result <- run_prema_pecan_trait_ma(
   output_dir = OUTPUT_DIR,
   pftspecies_rdata = PFTSPECIES_RDATA,
   trydat_use_species_rdata = TRYDAT_USE_SPECIES_RDATA,
-  pft_coordinate_map_file = PFT_COORDINATE_MAP_FILE,
+  pft_coordinate_map_file = if (
+    identical(PFT_ASSIGNMENT_MODE, "spatial_observation")
+  ) PFT_COORDINATE_MAP_FILE else NULL,
+  pft_assignment_mode = PFT_ASSIGNMENT_MODE,
   observation_coordinate_file = TRY_OBSERVATION_COORDINATE_FILE_USE,
   observation_coordinate_data = TRY_OBSERVATION_COORDINATE_DATA,
   iterations = MA_ITERATIONS,
