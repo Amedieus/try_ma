@@ -1,6 +1,6 @@
 options(stringsAsFactors = FALSE)
 
-PREMA_PECAN_PIPELINE_VERSION <- "2026-09-03.5"
+PREMA_PECAN_PIPELINE_VERSION <- "2026-09-04.2"
 
 
 # =============================================================================
@@ -318,25 +318,146 @@ load_prema_table <- function(path, preferred_names = character()) {
 }
 
 
-# Select TRY observations for one target PFT using one of two explicit rules.
+# Resolve and normalize the point table used by the PFT-range selector.
+.prema_resolve_table_column <- function(x, candidates, label) {
+  found <- intersect(candidates, names(x))
+  if (length(found) == 0L) {
+    stop(
+      label, " column was not found. Tried: ",
+      paste(candidates, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  found[[1L]]
+}
+
+
+.prema_target_pft_points <- function(pft_coordinate_map, pft_name) {
+  x <- data.table::copy(data.table::as.data.table(pft_coordinate_map))
+  pft_col <- .prema_resolve_table_column(
+    x,
+    c("final_pft", "pftname", "pft_name", "pft", "PFT"),
+    "Reference PFT"
+  )
+  lat_col <- .prema_resolve_table_column(
+    x,
+    c("lat", "latitude", "Latitude", "LAT"),
+    "Reference latitude"
+  )
+  lon_col <- .prema_resolve_table_column(
+    x,
+    c("lon", "longitude", "Longitude", "LON", "long"),
+    "Reference longitude"
+  )
+
+  points <- unique(data.table::data.table(
+    pft = trimws(as.character(x[[pft_col]])),
+    latitude = suppressWarnings(as.numeric(as.character(x[[lat_col]]))),
+    longitude = suppressWarnings(as.numeric(as.character(x[[lon_col]])))
+  ))
+  points <- points[
+    pft == pft_name &
+      is.finite(latitude) & latitude >= -90 & latitude <= 90 &
+      is.finite(longitude) & longitude >= -180 & longitude <= 180
+  ]
+  if (nrow(points) == 0L) {
+    stop(
+      "pft_coordinate_map has no usable points for target PFT ",
+      pft_name, ".",
+      call. = FALSE
+    )
+  }
+  data.table::setorder(points, latitude, longitude)
+  points[]
+}
+
+
+# Test each coordinate against the union of the latitude/longitude rectangles
+# centered on all target-PFT points. Longitude distance is circular so a box
+# crossing the antimeridian is handled correctly.
+.prema_in_pft_degree_boxes <- function(
+    latitude,
+    longitude,
+    reference_points,
+    buffer_degrees = 1
+) {
+  buffer_degrees <- as.numeric(buffer_degrees)
+  if (
+    length(buffer_degrees) != 1L ||
+    !is.finite(buffer_degrees) ||
+    buffer_degrees <= 0 ||
+    buffer_degrees > 180
+  ) {
+    stop("buffer_degrees must be in (0, 180].", call. = FALSE)
+  }
+
+  latitude <- suppressWarnings(as.numeric(latitude))
+  longitude <- suppressWarnings(as.numeric(longitude))
+  inside <- rep(FALSE, length(latitude))
+  valid <-
+    is.finite(latitude) & latitude >= -90 & latitude <= 90 &
+    is.finite(longitude) & longitude >= -180 & longitude <= 180
+  if (!any(valid)) return(inside)
+
+  reference <- data.table::copy(data.table::as.data.table(reference_points))
+  data.table::setorder(reference, latitude, longitude)
+  reference_latitude <- reference$latitude
+  reference_longitude <- reference$longitude
+  valid_rows <- which(valid)
+
+  # left.open=TRUE makes the lower-bound lookup inclusive when the lower
+  # boundary exactly equals a reference latitude.
+  lower_index <- findInterval(
+    latitude[valid_rows] - buffer_degrees,
+    reference_latitude,
+    left.open = TRUE
+  ) + 1L
+  upper_index <- findInterval(
+    latitude[valid_rows] + buffer_degrees,
+    reference_latitude
+  )
+
+  for (position in seq_along(valid_rows)) {
+    lower_i <- max(1L, lower_index[[position]])
+    upper_i <- min(length(reference_latitude), upper_index[[position]])
+    if (lower_i > upper_i) next
+    candidate_i <- seq.int(lower_i, upper_i)
+    longitude_delta <- abs(
+      ((reference_longitude[candidate_i] -
+          longitude[valid_rows[[position]]] + 180) %% 360) - 180
+    )
+    inside[valid_rows[[position]]] <- any(
+      longitude_delta <= buffer_degrees
+    )
+  }
+  inside
+}
+
+
+# Select TRY observations for one target PFT using one of three explicit rules.
 #
-# `share_species` (default): species membership is the inclusion rule. Every
-# TRY observation belonging to a species listed for the target PFT is retained,
-# even when that species is also listed for other PFTs. Coordinates and the
-# 250-km threshold are deliberately ignored in this mode.
+# pft_range_species (default): begin with species listed for the target PFT
+# in pftspecies. A candidate species is retained when at least one of its valid
+# TRY coordinates is inside any target-PFT point's +/- degree rectangle. A
+# species with no valid coordinates at all is retained by an explicit fallback.
+# Once eligible, all observations of that species are retained, including rows
+# without coordinates.
 #
-# `spatial_observation`: preserve the optional older rule. Ambiguous-species
-# observations are assigned to the nearest candidate-PFT reference point and
-# may be excluded for missing coordinates or excessive distance.
+# share_species: retain every observation of every listed species.
+#
+# spatial_observation: preserve the older nearest-point / km rule.
 select_prema_pft_observations <- function(
     trydat_use_species,
     pftspecies,
     pft_name,
     pft_coordinate_map = NULL,
-    assignment_mode = c("share_species", "spatial_observation"),
+    assignment_mode = c(
+      "pft_range_species", "share_species", "spatial_observation"
+    ),
     observation_coordinate_data = NULL,
     observation_lat_col = "Latitude",
     observation_lon_col = "Longitude",
+    pft_range_buffer_degrees = 1,
     max_distance_km = 250
 ) {
   .prema_require_packages("data.table")
@@ -345,17 +466,18 @@ select_prema_pft_observations <- function(
   if (length(pft_name) != 1L || is.na(pft_name) || !nzchar(pft_name)) {
     stop("pft_name must be one non-empty string.", call. = FALSE)
   }
-  if (identical(assignment_mode, "spatial_observation")) {
-    .prema_require_functions(c(
-      "attach_try_observation_coordinates",
-      "assign_try_observations_to_pft"
-    ))
+  coordinate_modes <- c("pft_range_species", "spatial_observation")
+  if (assignment_mode %in% coordinate_modes) {
+    .prema_require_functions("attach_try_observation_coordinates")
     if (is.null(pft_coordinate_map)) {
       stop(
-        "pft_coordinate_map is required for spatial_observation mode.",
+        "pft_coordinate_map is required for ", assignment_mode, " mode.",
         call. = FALSE
       )
     }
+  }
+  if (identical(assignment_mode, "spatial_observation")) {
+    .prema_require_functions("assign_try_observations_to_pft")
   }
   try_dt <- data.table::copy(data.table::as.data.table(trydat_use_species))
   pft_dt <- data.table::copy(data.table::as.data.table(pftspecies))
@@ -455,9 +577,9 @@ select_prema_pft_observations <- function(
     )
   ]
   candidates[, shared_across_pfts := pft_candidate_count > 1L]
-  candidates[, species_key_prema__ := NULL]
 
   if (identical(assignment_mode, "share_species")) {
+    candidates[, species_key_prema__ := NULL]
     candidates[, `:=`(
       assigned_final_pft = pft_name,
       pft_assignment_method = data.table::fifelse(
@@ -574,6 +696,211 @@ select_prema_pft_observations <- function(
   if (!observation_lon_col %in% names(candidates)) {
     candidates[, (observation_lon_col) := NA_real_]
   }
+
+  if (identical(assignment_mode, "pft_range_species")) {
+    buffer_degrees <- as.numeric(pft_range_buffer_degrees)
+    if (
+      length(buffer_degrees) != 1L ||
+      !is.finite(buffer_degrees) ||
+      buffer_degrees <= 0 ||
+      buffer_degrees > 180
+    ) {
+      stop(
+        "pft_range_buffer_degrees must be in (0, 180].",
+        call. = FALSE
+      )
+    }
+
+    reference_points <- .prema_target_pft_points(
+      pft_coordinate_map,
+      pft_name
+    )
+    candidates[, (observation_lat_col) := suppressWarnings(
+      as.numeric(as.character(get(observation_lat_col)))
+    )]
+    candidates[, (observation_lon_col) := suppressWarnings(
+      as.numeric(as.character(get(observation_lon_col)))
+    )]
+    candidates[, coordinate_valid_prema__ :=
+      is.finite(get(observation_lat_col)) &
+      get(observation_lat_col) >= -90 &
+      get(observation_lat_col) <= 90 &
+      is.finite(get(observation_lon_col)) &
+      get(observation_lon_col) >= -180 &
+      get(observation_lon_col) <= 180
+    ]
+    candidates[, coordinate_in_range_prema__ :=
+      .prema_in_pft_degree_boxes(
+        latitude = get(observation_lat_col),
+        longitude = get(observation_lon_col),
+        reference_points = reference_points,
+        buffer_degrees = buffer_degrees
+      )
+    ]
+
+    species_range_audit <- candidates[
+      ,
+      {
+        any_valid <- any(coordinate_valid_prema__)
+        any_inside <- any(coordinate_in_range_prema__)
+        list(
+          n_try_rows = .N,
+          n_valid_coordinate_rows = sum(coordinate_valid_prema__),
+          n_missing_or_invalid_coordinate_rows =
+            sum(!coordinate_valid_prema__),
+          n_in_range_coordinate_rows = sum(coordinate_in_range_prema__),
+          eligible_species = any_inside || !any_valid,
+          eligibility_reason = if (any_inside) {
+            "IN_PFT_POINT_BUFFER"
+          } else if (!any_valid) {
+            "NO_VALID_COORDINATES_INCLUDED"
+          } else {
+            "KNOWN_COORDINATES_OUTSIDE_PFT_RANGE"
+          }
+        )
+      },
+      by = .(species_id = species_key_prema__)
+    ]
+    species_range_audit[, `:=`(
+      pft = pft_name,
+      pft_reference_point_count = nrow(reference_points),
+      pft_range_buffer_degrees = buffer_degrees
+    )]
+    data.table::setcolorder(
+      species_range_audit,
+      c(
+        "pft", "species_id", "eligible_species", "eligibility_reason",
+        "n_try_rows", "n_valid_coordinate_rows",
+        "n_missing_or_invalid_coordinate_rows",
+        "n_in_range_coordinate_rows", "pft_reference_point_count",
+        "pft_range_buffer_degrees"
+      )
+    )
+
+    candidates[
+      species_range_audit,
+      on = .(species_key_prema__ = species_id),
+      `:=`(
+        pft_range_eligible = i.eligible_species,
+        pft_species_eligibility_reason = i.eligibility_reason
+      )
+    ]
+    selected <- data.table::copy(candidates[pft_range_eligible == TRUE])
+    unassigned <- data.table::copy(candidates[pft_range_eligible == FALSE])
+    if (nrow(selected) == 0L) {
+      stop(
+        "No target-PFT candidate species passed the +/-",
+        format(buffer_degrees, trim = TRUE),
+        " degree range rule for `", pft_name, "`.",
+        call. = FALSE
+      )
+    }
+
+    selected[, `:=`(
+      assigned_final_pft = pft_name,
+      pft_assignment_method = data.table::fifelse(
+        pft_species_eligibility_reason == "IN_PFT_POINT_BUFFER",
+        "pft_range_species_in_range",
+        "pft_range_species_no_valid_coordinates"
+      ),
+      pft_assignment_distance_km = NA_real_,
+      pft_assignment_status = "ASSIGNED",
+      final_pft = pft_name
+    )]
+    selected[, pft_assignment_method_prema := pft_assignment_method]
+    unassigned[, `:=`(
+      assigned_final_pft = NA_character_,
+      pft_assignment_method = "species_outside_pft_degree_buffer",
+      pft_assignment_distance_km = NA_real_,
+      pft_assignment_status = "UNASSIGNED"
+    )]
+
+    assignment_records <- data.table::rbindlist(
+      list(selected, unassigned),
+      use.names = TRUE,
+      fill = TRUE
+    )
+    assignment_audit <- assignment_records[
+      ,
+      .(
+        n_observations = .N,
+        n_species = data.table::uniqueN(
+          trimws(as.character(AccSpeciesID))
+        )
+      ),
+      by = .(
+        pft_assignment_status,
+        pft_assignment_method,
+        assigned_final_pft
+      )
+    ]
+    coordinate_join_audit[, coordinate_usage := "PFT_RANGE_SPECIES"]
+    audit <- data.table::data.table(
+      pft = pft_name,
+      assignment_mode = assignment_mode,
+      input_try_rows = input_try_rows,
+      target_candidate_species = length(target_species),
+      target_candidate_rows = nrow(candidates),
+      target_reference_points = nrow(reference_points),
+      pft_range_buffer_degrees = buffer_degrees,
+      selected_rows = nrow(selected),
+      selected_species = species_range_audit[
+        eligible_species == TRUE, .N
+      ],
+      selected_in_range_species = species_range_audit[
+        eligibility_reason == "IN_PFT_POINT_BUFFER", .N
+      ],
+      selected_no_coordinate_species = species_range_audit[
+        eligibility_reason == "NO_VALID_COORDINATES_INCLUDED", .N
+      ],
+      excluded_outside_range_species = species_range_audit[
+        eligibility_reason == "KNOWN_COORDINATES_OUTSIDE_PFT_RANGE", .N
+      ],
+      selected_unique_species_rows = selected[
+        shared_across_pfts == FALSE, .N
+      ],
+      selected_shared_species_rows = selected[
+        shared_across_pfts == TRUE, .N
+      ],
+      selected_spatial_rows = as.integer(
+        species_range_audit[
+          eligible_species == TRUE,
+          sum(n_in_range_coordinate_rows)
+        ]
+      ),
+      selected_rows_from_in_range_species = selected[
+        pft_species_eligibility_reason == "IN_PFT_POINT_BUFFER", .N
+      ],
+      excluded_ambiguous_rows = nrow(unassigned),
+      excluded_unassigned_candidate_rows = nrow(unassigned),
+      max_distance_km = NA_real_
+    )
+
+    helper_columns <- c(
+      "species_key_prema__", "coordinate_valid_prema__",
+      "coordinate_in_range_prema__", "pft_range_eligible"
+    )
+    selected[, (helper_columns) := NULL]
+    unassigned[, (helper_columns) := NULL]
+    attr(selected, "pft_selection_audit") <- audit
+    attr(selected, "excluded_ambiguous_rows") <- unassigned
+    attr(selected, "observation_pft_assignment_audit") <-
+      assignment_audit
+    attr(selected, "observation_pft_assignment_configuration") <- list(
+      assignment_mode = assignment_mode,
+      coordinates_used = TRUE,
+      pft_range_buffer_degrees = buffer_degrees,
+      range_definition = "union_of_latitude_longitude_boxes",
+      missing_coordinate_species_policy = "include_only_if_species_has_no_valid_coordinates"
+    )
+    attr(selected, "observation_coordinate_join_audit") <-
+      coordinate_join_audit
+    attr(selected, "pft_species_range_audit") <- species_range_audit[]
+    attr(selected, "pft_reference_points_used") <- reference_points[]
+    return(selected[])
+  }
+
+  candidates[, species_key_prema__ := NULL]
 
   assigned <- assign_try_observations_to_pft(
     try_data = candidates,
@@ -1331,6 +1658,878 @@ build_prema_pecan_target_observations <- function(
 }
 
 
+# Select species for each target-specific empirical prior before MA.
+#
+# For 3-19 usable species, one species is sampled. For 20 or more, ceiling of
+# prior_species_fraction times n_species are sampled. For one or two species,
+# no random sample is taken and all available species medians are used.
+# All species remain in the likelihood, preserving the explicitly accepted
+# empirical-Bayes overlap while making it completely visible in the audit.
+split_prema_prior_species <- function(
+    target_observations,
+    prior_species_fraction = 0.10,
+    fraction_rule_min_species = 20L,
+    no_holdout_max_species = 2L,
+    seed = 20260904L
+) {
+  .prema_require_packages("data.table")
+  x <- data.table::copy(data.table::as.data.table(target_observations))
+  required <- c(
+    "pecan_trait", "species_key", "target_value", "site_key"
+  )
+  missing <- setdiff(required, names(x))
+  if (length(missing) > 0L) {
+    stop(
+      "target_observations is missing prior-split columns: ",
+      paste(missing, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  if (
+    length(prior_species_fraction) != 1L ||
+    !is.finite(prior_species_fraction) ||
+    prior_species_fraction <= 0 ||
+    prior_species_fraction > 1
+  ) {
+    stop("prior_species_fraction must be in (0, 1].", call. = FALSE)
+  }
+  fraction_rule_min_species <- as.integer(fraction_rule_min_species)
+  no_holdout_max_species <- as.integer(no_holdout_max_species)
+  if (
+    is.na(fraction_rule_min_species) ||
+    is.na(no_holdout_max_species) ||
+    no_holdout_max_species < 1L ||
+    fraction_rule_min_species <= no_holdout_max_species
+  ) {
+    stop(
+      "fraction_rule_min_species must exceed no_holdout_max_species >= 1.",
+      call. = FALSE
+    )
+  }
+  if (length(seed) != 1L || !is.finite(seed)) {
+    stop("seed must be one finite integer.", call. = FALSE)
+  }
+
+  x[, pecan_trait := trimws(as.character(pecan_trait))]
+  x[, prior_species_key__ := .prema_nonempty_text(species_key)]
+  x[, target_value := suppressWarnings(as.numeric(target_value))]
+  if (any(!is.finite(x$target_value))) {
+    stop("target_observations contains non-finite target_value.", call. = FALSE)
+  }
+
+  set.seed(as.integer(seed))
+  traits <- sort(unique(x$pecan_trait))
+  likelihood_rows <- vector("list", length(traits))
+  prior_source_rows <- vector("list", length(traits))
+  prior_value_rows <- vector("list", length(traits))
+  assignment_rows <- vector("list", length(traits))
+  audit_rows <- vector("list", length(traits))
+
+  for (trait_index in seq_along(traits)) {
+    trait_i <- traits[[trait_index]]
+    one <- data.table::copy(x[pecan_trait == trait_i])
+    usable_species <- sort(unique(
+      one[!is.na(prior_species_key__), prior_species_key__]
+    ))
+    n_species <- length(usable_species)
+    if (n_species == 0L) {
+      stop(
+        "Target ", trait_i,
+        " has no usable species identifier for prior construction.",
+        call. = FALSE
+      )
+    }
+
+    if (n_species <= no_holdout_max_species) {
+      prior_species <- usable_species
+      n_randomly_selected <- 0L
+      selection_rule <- "ALL_SPECIES_PRIOR_NO_RANDOM_SAMPLE_LE2"
+    } else {
+      n_select <- if (n_species < fraction_rule_min_species) {
+        1L
+      } else {
+        as.integer(ceiling(prior_species_fraction * n_species))
+      }
+      n_select <- min(n_species, max(1L, n_select))
+      prior_species <- sort(sample(
+        usable_species,
+        size = n_select,
+        replace = FALSE
+      ))
+      n_randomly_selected <- length(prior_species)
+      selection_rule <- if (n_species < fraction_rule_min_species) {
+        "SAMPLE_ONE_SPECIES_LT20"
+      } else {
+        "SAMPLE_CEILING_10_PERCENT_SPECIES"
+      }
+    }
+
+    # The user explicitly chose to keep the current empirical-Bayes overlap:
+    # selected prior species are NOT deleted from the MA likelihood.
+    likelihood_one <- data.table::copy(one)
+    prior_source_one <- data.table::copy(
+      one[prior_species_key__ %in% prior_species]
+    )
+    if (nrow(prior_source_one) == 0L) {
+      stop(
+        "Target ", trait_i,
+        " has no rows for the selected prior species.",
+        call. = FALSE
+      )
+    }
+
+    prior_values_one <- prior_source_one[
+      ,
+      .(
+        prior_value = stats::median(target_value, na.rm = TRUE),
+        n_source_rows = .N
+      ),
+      by = .(
+        pecan_trait,
+        species_key = prior_species_key__
+      )
+    ]
+    species_assignments_one <- one[
+      !is.na(prior_species_key__),
+      .(n_target_rows = .N),
+      by = .(
+        pecan_trait,
+        species_key = prior_species_key__
+      )
+    ]
+    species_assignments_one[
+      ,
+      species_role := data.table::fifelse(
+        species_key %in% prior_species,
+        "PRIOR_AND_LIKELIHOOD_SELECTED",
+        "LIKELIHOOD_NOT_SELECTED_FOR_PRIOR"
+      )
+    ]
+    species_assignments_one[, selection_rule := selection_rule]
+
+    likelihood_rows[[trait_index]] <- likelihood_one
+    prior_source_rows[[trait_index]] <- prior_source_one
+    prior_value_rows[[trait_index]] <- prior_values_one
+    assignment_rows[[trait_index]] <- species_assignments_one
+    audit_rows[[trait_index]] <- data.table::data.table(
+      pecan_trait = trait_i,
+      n_available_species = n_species,
+      n_prior_species_used = length(prior_species),
+      n_prior_species_selected_randomly = n_randomly_selected,
+      n_prior_species_removed_from_likelihood = 0L,
+      # Compatibility column for older result readers.
+      n_prior_species_held_out = 0L,
+      n_likelihood_species = data.table::uniqueN(
+        likelihood_one$prior_species_key__,
+        na.rm = TRUE
+      ),
+      n_all_target_rows = nrow(one),
+      n_prior_source_rows = nrow(prior_source_one),
+      n_likelihood_rows = nrow(likelihood_one),
+      n_rows_without_species_id = sum(is.na(one$prior_species_key__)),
+      prior_species_fraction = as.numeric(prior_species_fraction),
+      fraction_rule_min_species = fraction_rule_min_species,
+      no_holdout_max_species = no_holdout_max_species,
+      selection_rule = selection_rule,
+      prior_likelihood_species_overlap = TRUE
+    )
+  }
+
+  likelihood <- data.table::rbindlist(
+    likelihood_rows,
+    use.names = TRUE,
+    fill = TRUE
+  )
+  prior_source <- data.table::rbindlist(
+    prior_source_rows,
+    use.names = TRUE,
+    fill = TRUE
+  )
+  prior_values <- data.table::rbindlist(
+    prior_value_rows,
+    use.names = TRUE,
+    fill = TRUE
+  )
+  assignments <- data.table::rbindlist(
+    assignment_rows,
+    use.names = TRUE,
+    fill = TRUE
+  )
+  audit <- data.table::rbindlist(
+    audit_rows,
+    use.names = TRUE,
+    fill = TRUE
+  )
+
+  # Reindex within each independently fitted target so JAGS never sees gaps.
+  likelihood[
+    ,
+    site_id := as.integer(factor(site_key)),
+    by = pecan_trait
+  ]
+  likelihood[, target_observation_id := seq_len(.N)]
+  likelihood[, prior_species_key__ := NULL]
+  prior_source[, prior_species_key__ := NULL]
+
+  list(
+    likelihood_observations = likelihood[],
+    prior_source_observations = prior_source[],
+    prior_species_values = prior_values[],
+    species_assignments = assignments[],
+    trait_audit = audit[],
+    configuration = list(
+      prior_species_fraction = as.numeric(prior_species_fraction),
+      fraction_rule_min_species = fraction_rule_min_species,
+      no_holdout_max_species = no_holdout_max_species,
+      seed = as.integer(seed),
+      species_summary = "median",
+      selected_prior_species_removed_from_likelihood = FALSE,
+      empirical_prior_likelihood_overlap = TRUE,
+      sparse_trait_policy =
+        "all_species_prior_and_likelihood_no_random_sample_when_le2",
+      split_scope =
+        "anchor_species_of_prebuilt_target_observations"
+    )
+  )
+}
+
+
+.prema_prior_cdf <- function(point, distn, parama, paramb) {
+  point <- suppressWarnings(as.numeric(point))
+  parama <- suppressWarnings(as.numeric(parama))
+  paramb <- suppressWarnings(as.numeric(paramb))
+  if (
+    length(point) != 1L || length(parama) != 1L ||
+    length(paramb) != 1L || !is.finite(point) ||
+    !is.finite(parama) || !is.finite(paramb)
+  ) {
+    return(NA_real_)
+  }
+
+  switch(
+    as.character(distn),
+    norm = stats::pnorm(point, mean = parama, sd = paramb),
+    lnorm = stats::plnorm(point, meanlog = parama, sdlog = paramb),
+    beta = stats::pbeta(point, shape1 = parama, shape2 = paramb),
+    unif = stats::punif(point, min = parama, max = paramb),
+    stop(
+      "Unsupported PEcAn prior distribution in preflight: ",
+      as.character(distn),
+      call. = FALSE
+    )
+  )
+}
+
+
+# Build a prior from one median per selected prior species, then reproduce
+# PEcAn.MA's likelihood-median consistency check before starting JAGS.
+#
+# Prior parameters are anchored in the selected prior species. Width,
+# concentration, or bounded support is relaxed only when needed so PEcAn.MA
+# will not abort with "inconsistent with priors". Physical support is retained.
+make_prema_species_prior_distns <- function(
+    prior_species_values,
+    likelihood_observations,
+    likelihood_jagged_summary,
+    targets,
+    writer_contract,
+    unit_map,
+    seed = 20260905L,
+    width_multiplier = 10,
+    relative_sd_floor = 0.10,
+    pecan_consistency_tail = 0.025
+) {
+  .prema_require_packages("data.table")
+  .prema_require_functions("make_prior_distns_from_trait_data")
+  values <- data.table::copy(
+    data.table::as.data.table(prior_species_values)
+  )
+  likelihood <- data.table::copy(
+    data.table::as.data.table(likelihood_observations)
+  )
+
+  required_prior <- c("pecan_trait", "species_key", "prior_value")
+  missing_prior <- setdiff(required_prior, names(values))
+  if (length(missing_prior) > 0L) {
+    stop(
+      "prior_species_values is missing: ",
+      paste(missing_prior, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  required_likelihood <- c("pecan_trait", "species_key", "target_value")
+  missing_likelihood <- setdiff(required_likelihood, names(likelihood))
+  if (length(missing_likelihood) > 0L) {
+    stop(
+      "likelihood_observations is missing: ",
+      paste(missing_likelihood, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  targets <- trimws(as.character(targets))
+  if (
+    length(targets) == 0L ||
+    anyNA(targets) ||
+    any(!nzchar(targets))
+  ) {
+    stop("targets must contain non-empty trait names.", call. = FALSE)
+  }
+  targets <- sort(unique(targets))
+
+  jagged_summary <- data.table::copy(
+    data.table::as.data.table(likelihood_jagged_summary)
+  )
+  required_jagged <- c(
+    "pecan_trait", "n_jagged_rows",
+    "jagged_min", "jagged_median", "jagged_max"
+  )
+  missing_jagged <- setdiff(required_jagged, names(jagged_summary))
+  if (length(missing_jagged) > 0L) {
+    stop(
+      "likelihood_jagged_summary is missing: ",
+      paste(missing_jagged, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  jagged_summary[, pecan_trait := trimws(as.character(pecan_trait))]
+  if (
+    anyNA(jagged_summary$pecan_trait) ||
+    any(!nzchar(jagged_summary$pecan_trait)) ||
+    anyDuplicated(jagged_summary$pecan_trait)
+  ) {
+    stop(
+      "likelihood_jagged_summary must have one uniquely named row per target.",
+      call. = FALSE
+    )
+  }
+  for (numeric_column in required_jagged[-1L]) {
+    jagged_summary[
+      ,
+      (numeric_column) := suppressWarnings(
+        as.numeric(get(numeric_column))
+      )
+    ]
+  }
+  missing_jagged_targets <- setdiff(
+    targets,
+    jagged_summary$pecan_trait
+  )
+  if (length(missing_jagged_targets) > 0L) {
+    stop(
+      "No exact PEcAn jagged likelihood summary for: ",
+      paste(missing_jagged_targets, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  target_jagged_summary <- jagged_summary[
+    pecan_trait %in% targets
+  ]
+  jagged_numeric_matrix <- as.matrix(
+    target_jagged_summary[
+      ,
+      required_jagged[-1L],
+      with = FALSE
+    ]
+  )
+  if (
+    any(!is.finite(jagged_numeric_matrix)) ||
+    any(target_jagged_summary$n_jagged_rows < 1)
+  ) {
+    stop(
+      "Exact PEcAn jagged likelihood summaries must be finite and non-empty.",
+      call. = FALSE
+    )
+  }
+  if (
+    length(pecan_consistency_tail) != 1L ||
+    !is.finite(pecan_consistency_tail) ||
+    pecan_consistency_tail < 0.025 ||
+    pecan_consistency_tail >= 0.5
+  ) {
+    stop(
+      "pecan_consistency_tail must be in [0.025, 0.5).",
+      call. = FALSE
+    )
+  }
+
+  values[, pecan_trait := trimws(as.character(pecan_trait))]
+  values[, species_key := trimws(as.character(species_key))]
+  values[, prior_value := suppressWarnings(as.numeric(prior_value))]
+  likelihood[, pecan_trait := trimws(as.character(pecan_trait))]
+  likelihood[, species_key := trimws(as.character(species_key))]
+  likelihood[, target_value := suppressWarnings(as.numeric(target_value))]
+
+  missing_prior_targets <- setdiff(targets, unique(values$pecan_trait))
+  if (length(missing_prior_targets) > 0L) {
+    stop(
+      "No species-level prior values for: ",
+      paste(missing_prior_targets, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  missing_likelihood_targets <- setdiff(
+    targets,
+    unique(likelihood$pecan_trait)
+  )
+  if (length(missing_likelihood_targets) > 0L) {
+    stop(
+      "No likelihood observations for prior preflight: ",
+      paste(missing_likelihood_targets, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  prior_trait.data <- lapply(targets, function(trait_i) {
+    data.frame(
+      mean = values[
+        pecan_trait == trait_i & is.finite(prior_value),
+        as.numeric(prior_value)
+      ],
+      stringsAsFactors = FALSE
+    )
+  })
+  names(prior_trait.data) <- targets
+  empty_prior_targets <- targets[
+    vapply(prior_trait.data, nrow, integer(1)) == 0L
+  ]
+  if (length(empty_prior_targets) > 0L) {
+    stop(
+      "No finite species-level prior values for: ",
+      paste(empty_prior_targets, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  max_prior_species <- max(
+    vapply(prior_trait.data, nrow, integer(1))
+  )
+  prior_registry <- prema_target_prior_registry(
+    targets,
+    writer_contract
+  )
+  prior.distns <- make_prior_distns_from_trait_data(
+    trait.data = prior_trait.data,
+    sample_fraction = 1,
+    min_sample_n = 1L,
+    max_sample_n = as.integer(max_prior_species),
+    width_multiplier = width_multiplier,
+    relative_sd_floor = relative_sd_floor,
+    seed = as.integer(seed),
+    unit_map = unit_map,
+    prior_registry = prior_registry,
+    positive_distribution = "lnorm",
+    domain_action = "stop"
+  )
+
+  base_parameter_audit <- data.table::copy(data.table::as.data.table(
+    attr(prior.distns, "prior_parameter_audit")
+  ))
+  target_tail <- min(
+    0.499,
+    as.numeric(pecan_consistency_tail) + 1e-4
+  )
+  z_limit <- stats::qnorm(1 - target_tail)
+  preflight_rows <- vector("list", length(targets))
+
+  for (trait_index in seq_along(targets)) {
+    trait_i <- targets[[trait_index]]
+    prior_values_i <- values[
+      pecan_trait == trait_i & is.finite(prior_value),
+      prior_value
+    ]
+    likelihood_i <- likelihood[
+      pecan_trait == trait_i & is.finite(target_value),
+      target_value
+    ]
+    if (length(likelihood_i) == 0L) {
+      stop(
+        "No finite likelihood observations for ", trait_i, ".",
+        call. = FALSE
+      )
+    }
+
+    rule <- prior_registry[trait == trait_i][1L]
+    jagged_i <- jagged_summary[pecan_trait == trait_i][1L]
+    raw_likelihood_median <- stats::median(likelihood_i)
+    likelihood_median <- as.numeric(jagged_i$jagged_median)
+    likelihood_min <- min(likelihood_i)
+    likelihood_max <- max(likelihood_i)
+    prior_center <- stats::median(prior_values_i)
+    prior_species_sd <- if (length(prior_values_i) >= 2L) {
+      stats::sd(prior_values_i)
+    } else {
+      NA_real_
+    }
+
+    distn <- as.character(prior.distns[trait_i, "distn"])
+    parama_before <- as.numeric(prior.distns[trait_i, "parama"])
+    paramb_before <- as.numeric(prior.distns[trait_i, "paramb"])
+    parama_after <- parama_before
+    paramb_after <- paramb_before
+    empirical_parama <- parama_before
+    empirical_paramb <- paramb_before
+    adjustment_method <- "NONE"
+    beta_strength <- NA_real_
+
+    if (identical(distn, "unif")) {
+      hard_lower <- as.numeric(rule$lower)
+      hard_upper <- as.numeric(rule$upper)
+      if (
+        !is.finite(hard_lower) || !is.finite(hard_upper) ||
+        hard_upper <= hard_lower
+      ) {
+        stop(
+          "Uniform prior needs finite physical bounds for ", trait_i, ".",
+          call. = FALSE
+        )
+      }
+
+      variability_candidates <- c(
+        prior_species_sd,
+        relative_sd_floor * max(abs(prior_center), 1)
+      )
+      variability_candidates <- variability_candidates[
+        is.finite(variability_candidates) & variability_candidates > 0
+      ]
+      empirical_half_width <- width_multiplier * if (
+        length(variability_candidates) > 0L
+      ) {
+        max(variability_candidates)
+      } else {
+        max((hard_upper - hard_lower) * 0.05, 1)
+      }
+      parama_after <- max(hard_lower, prior_center - empirical_half_width)
+      paramb_after <- min(hard_upper, prior_center + empirical_half_width)
+      if (
+        !is.finite(parama_after) || !is.finite(paramb_after) ||
+        paramb_after <= parama_after
+      ) {
+        stop(
+          "Could not construct a non-degenerate bounded prior for ",
+          trait_i,
+          call. = FALSE
+        )
+      }
+      empirical_parama <- parama_after
+      empirical_paramb <- paramb_after
+      adjustment_method <- "SPECIES_CENTERED_BOUNDED_UNIFORM"
+
+      cdf_i <- .prema_prior_cdf(
+        likelihood_median,
+        distn,
+        parama_after,
+        paramb_after
+      )
+      if (!is.finite(cdf_i) || cdf_i < target_tail) {
+        required_lower <- (
+          likelihood_median - target_tail * paramb_after
+        ) / (1 - target_tail)
+        parama_after <- max(
+          hard_lower,
+          min(parama_after, required_lower)
+        )
+      }
+      cdf_i <- .prema_prior_cdf(
+        likelihood_median,
+        distn,
+        parama_after,
+        paramb_after
+      )
+      if (!is.finite(cdf_i) || cdf_i > 1 - target_tail) {
+        required_upper <- (
+          likelihood_median - target_tail * parama_after
+        ) / (1 - target_tail)
+        paramb_after <- min(
+          hard_upper,
+          max(paramb_after, required_upper)
+        )
+      }
+      if (
+        !isTRUE(all.equal(parama_after, empirical_parama)) ||
+        !isTRUE(all.equal(paramb_after, empirical_paramb))
+      ) {
+        adjustment_method <- paste0(
+          adjustment_method,
+          "+EXPANDED_FOR_LIKELIHOOD_MEDIAN"
+        )
+      }
+    } else if (identical(distn, "beta")) {
+      beta_values <- pmin(
+        1 - 1e-6,
+        pmax(1e-6, prior_values_i)
+      )
+      beta_mean <- mean(beta_values)
+      beta_variance <- if (length(beta_values) >= 2L) {
+        stats::var(beta_values)
+      } else {
+        NA_real_
+      }
+      moment_strength <- if (
+        is.finite(beta_variance) && beta_variance > 0
+      ) {
+        beta_mean * (1 - beta_mean) / beta_variance - 1
+      } else {
+        NA_real_
+      }
+      beta_strength <- if (
+        is.finite(moment_strength) && moment_strength > 0
+      ) {
+        min(50, max(0.10, moment_strength))
+      } else {
+        2
+      }
+
+      make_beta_parameters <- function(strength) {
+        c(
+          parama = max(1e-6, beta_mean * strength),
+          paramb = max(1e-6, (1 - beta_mean) * strength)
+        )
+      }
+      beta_parameters <- make_beta_parameters(beta_strength)
+      parama_after <- beta_parameters[["parama"]]
+      paramb_after <- beta_parameters[["paramb"]]
+      empirical_parama <- parama_after
+      empirical_paramb <- paramb_after
+      adjustment_method <- "SPECIES_PARAMETERIZED_BETA"
+
+      cdf_i <- .prema_prior_cdf(
+        likelihood_median,
+        distn,
+        parama_after,
+        paramb_after
+      )
+      while (
+        is.finite(cdf_i) &&
+        (cdf_i < target_tail || cdf_i > 1 - target_tail) &&
+        beta_strength > 1e-4
+      ) {
+        beta_strength <- beta_strength / 2
+        beta_parameters <- make_beta_parameters(beta_strength)
+        parama_after <- beta_parameters[["parama"]]
+        paramb_after <- beta_parameters[["paramb"]]
+        cdf_i <- .prema_prior_cdf(
+          likelihood_median,
+          distn,
+          parama_after,
+          paramb_after
+        )
+      }
+
+      if (
+        !is.finite(cdf_i) ||
+        cdf_i < target_tail ||
+        cdf_i > 1 - target_tail
+      ) {
+        # A nearly non-informative symmetric beta is the bounded safety
+        # fallback. A tiny species-centered component preserves deterministic
+        # dependence on the selected prior-species values.
+        safety_shapes <- c(1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
+        resolved_shape <- FALSE
+        for (shape_i in safety_shapes) {
+          parama_candidate <- shape_i + beta_mean * 1e-6
+          paramb_candidate <- shape_i + (1 - beta_mean) * 1e-6
+          cdf_candidate <- .prema_prior_cdf(
+            likelihood_median,
+            distn,
+            parama_candidate,
+            paramb_candidate
+          )
+          if (
+            is.finite(cdf_candidate) &&
+            cdf_candidate >= target_tail &&
+            cdf_candidate <= 1 - target_tail
+          ) {
+            parama_after <- parama_candidate
+            paramb_after <- paramb_candidate
+            cdf_i <- cdf_candidate
+            beta_strength <- 1e-6
+            resolved_shape <- TRUE
+            break
+          }
+        }
+        if (resolved_shape) {
+          adjustment_method <- paste0(
+            adjustment_method,
+            "+BOUNDED_WEAK_SAFETY_FALLBACK"
+          )
+        }
+      } else if (
+        !isTRUE(all.equal(parama_after, empirical_parama)) ||
+        !isTRUE(all.equal(paramb_after, empirical_paramb))
+      ) {
+        adjustment_method <- paste0(
+          adjustment_method,
+          "+LOWER_CONCENTRATION_FOR_LIKELIHOOD_MEDIAN"
+        )
+      }
+    } else if (identical(distn, "lnorm")) {
+      if (!is.finite(likelihood_median) || likelihood_median <= 0) {
+        stop(
+          "Positive lognormal target ", trait_i,
+          " has a non-positive likelihood median; cannot satisfy ",
+          "PEcAn prior consistency without changing its physical domain.",
+          call. = FALSE
+        )
+      }
+      required_sdlog <- abs(
+        log(likelihood_median) - parama_after
+      ) / z_limit
+      if (
+        is.finite(required_sdlog) &&
+        required_sdlog > paramb_after
+      ) {
+        paramb_after <- required_sdlog * 1.01
+        adjustment_method <- "WIDEN_SDLOG_FOR_LIKELIHOOD_MEDIAN"
+      }
+    } else if (identical(distn, "norm")) {
+      required_sd <- abs(
+        likelihood_median - parama_after
+      ) / z_limit
+      if (is.finite(required_sd) && required_sd > paramb_after) {
+        paramb_after <- required_sd * 1.01
+        adjustment_method <- "WIDEN_SD_FOR_LIKELIHOOD_MEDIAN"
+      }
+    } else {
+      stop(
+        "No prior preflight widening rule for distribution ",
+        distn, " (", trait_i, ").",
+        call. = FALSE
+      )
+    }
+
+    cdf_before <- .prema_prior_cdf(
+      likelihood_median,
+      distn,
+      parama_before,
+      paramb_before
+    )
+    cdf_after <- .prema_prior_cdf(
+      likelihood_median,
+      distn,
+      parama_after,
+      paramb_after
+    )
+    resolved <- (
+      is.finite(cdf_after) &&
+      cdf_after >= pecan_consistency_tail &&
+      cdf_after <= 1 - pecan_consistency_tail
+    )
+    if (!resolved) {
+      stop(
+        "Prior preflight could not make ", trait_i,
+        " compatible with its likelihood median while preserving domain. ",
+        "Likelihood median=", signif(likelihood_median, 8),
+        "; distribution=", distn,
+        "; final CDF=", signif(cdf_after, 8),
+        ". Check prior_species_values and target domain.",
+        call. = FALSE
+      )
+    }
+
+    prior.distns[trait_i, "parama"] <- as.numeric(parama_after)
+    prior.distns[trait_i, "paramb"] <- as.numeric(paramb_after)
+    preflight_rows[[trait_index]] <- data.table::data.table(
+      trait = trait_i,
+      n_prior_species = data.table::uniqueN(
+        values[pecan_trait == trait_i, species_key]
+      ),
+      selected_prior_species = paste(
+        sort(unique(values[pecan_trait == trait_i, species_key])),
+        collapse = " | "
+      ),
+      n_likelihood_species = data.table::uniqueN(
+        likelihood[pecan_trait == trait_i, species_key]
+      ),
+      n_prior_likelihood_species_overlap = length(intersect(
+        unique(values[pecan_trait == trait_i, species_key]),
+        unique(likelihood[pecan_trait == trait_i, species_key])
+      )),
+      prior_likelihood_species_overlap = all(
+        unique(values[pecan_trait == trait_i, species_key]) %in%
+          unique(likelihood[pecan_trait == trait_i, species_key])
+      ),
+      n_raw_likelihood_rows = length(likelihood_i),
+      n_pecan_jagged_rows = as.integer(jagged_i$n_jagged_rows),
+      prior_species_center = prior_center,
+      prior_species_sd = prior_species_sd,
+      raw_likelihood_min = likelihood_min,
+      raw_likelihood_median = raw_likelihood_median,
+      raw_likelihood_max = likelihood_max,
+      pecan_jagged_min = as.numeric(jagged_i$jagged_min),
+      likelihood_median = likelihood_median,
+      likelihood_median_source =
+        "median(PEcAn.MA::jagify(trait.data, use_ghs=FALSE)$Y)",
+      pecan_jagged_max = as.numeric(jagged_i$jagged_max),
+      distn = distn,
+      parama_before_preflight = parama_before,
+      paramb_before_preflight = paramb_before,
+      empirical_parama = empirical_parama,
+      empirical_paramb = empirical_paramb,
+      parama_after_preflight = as.numeric(parama_after),
+      paramb_after_preflight = as.numeric(paramb_after),
+      likelihood_median_cdf_before = cdf_before,
+      likelihood_median_cdf_after = cdf_after,
+      pecan_error_tail = 5e-4,
+      pecan_warning_tail = 0.025,
+      pecan_consistency_tail = as.numeric(pecan_consistency_tail),
+      adjusted_for_likelihood = (
+        !isTRUE(all.equal(parama_after, empirical_parama)) ||
+        !isTRUE(all.equal(paramb_after, empirical_paramb))
+      ),
+      adjustment_method = adjustment_method,
+      beta_final_strength = beta_strength,
+      pecan_preflight_resolved = resolved
+    )
+  }
+
+  preflight_audit <- data.table::rbindlist(
+    preflight_rows,
+    use.names = TRUE,
+    fill = TRUE
+  )
+  prior_parameter_audit <- merge(
+    base_parameter_audit,
+    preflight_audit,
+    by = "trait",
+    all = TRUE,
+    sort = FALSE
+  )
+  prior_parameter_audit[, target_order__ := match(trait, targets)]
+  data.table::setorder(prior_parameter_audit, target_order__)
+  prior_parameter_audit[, target_order__ := NULL]
+
+  prior_configuration <- attr(
+    prior.distns,
+    "prior_sampling_configuration"
+  )
+  prior_configuration$species_summary <- "one median per selected species"
+  prior_configuration$pecan_consistency_tail <-
+    as.numeric(pecan_consistency_tail)
+  prior_configuration$preflight_point <-
+    "exact median of PEcAn.MA::jagify(..., use_ghs=FALSE)$Y"
+  prior_configuration$preflight_rule <-
+    "same CDF rule used by PEcAn.MA::meta_analysis_standalone"
+  prior_configuration$bounded_prior_support_preserved <- TRUE
+
+  attr(prior.distns, "prior_species_values") <- values[]
+  attr(prior.distns, "prior_basis") <-
+    "one median per selected species; width preflighted on likelihood median"
+  attr(prior.distns, "prior_parameter_audit") <-
+    prior_parameter_audit[]
+  attr(prior.distns, "prior_compatibility_audit") <-
+    preflight_audit[]
+  attr(prior.distns, "prior_sampling_configuration") <-
+    prior_configuration
+
+  list(
+    prior.distns = prior.distns,
+    prior_registry = prior_registry,
+    prior_trait.data = prior_trait.data,
+    prior_compatibility_audit = preflight_audit[]
+  )
+}
+
+
 prema_observations_to_trait_data <- function(target_observations) {
   .prema_require_packages("data.table")
   x <- data.table::copy(data.table::as.data.table(target_observations))
@@ -1932,14 +3131,20 @@ run_prema_pecan_trait_ma <- function(
     pftspecies_rdata,
     trydat_use_species_rdata,
     pft_coordinate_map_file = NULL,
-    pft_assignment_mode = c("share_species", "spatial_observation"),
+    pft_assignment_mode = c(
+      "pft_range_species", "share_species", "spatial_observation"
+    ),
     observation_coordinate_file = NULL,
     observation_coordinate_data = NULL,
+    pft_range_buffer_degrees = 1,
+    prior_species_fraction = 0.10,
+    prior_fraction_rule_min_species = 20L,
+    prior_no_holdout_max_species = 2L,
     iterations = 3000L,
     workers = 2L,
     n_output_draws = 1000L,
     random = TRUE,
-    seed = 20260903L,
+    seed = 20260904L,
     context_overrides = list(),
     include_site_variability_in_samples = TRUE,
     sample_mode = c("new_site_predictive", "global_mean"),
@@ -2001,18 +3206,16 @@ run_prema_pecan_trait_ma <- function(
     length(pft_coordinate_map_file) == 1L &&
     !is.na(pft_coordinate_map_file) &&
     nzchar(trimws(pft_coordinate_map_file))
-  if (
-    identical(pft_assignment_mode, "spatial_observation") &&
-    !pft_coordinate_path_provided
-  ) {
+  coordinate_aware_pft_mode <- pft_assignment_mode %in%
+    c("pft_range_species", "spatial_observation")
+  if (coordinate_aware_pft_mode && !pft_coordinate_path_provided) {
     stop(
-      "pft_coordinate_map_file is required for spatial_observation mode.",
+      "pft_coordinate_map_file is required for ",
+      pft_assignment_mode, " mode.",
       call. = FALSE
     )
   }
-  pft_coordinate_map <- if (
-    identical(pft_assignment_mode, "spatial_observation")
-  ) {
+  pft_coordinate_map <- if (coordinate_aware_pft_mode) {
     load_prema_table(
       pft_coordinate_map_file,
       c("pft_coordinate_map", "final_pft_sites", "pft_sites")
@@ -2021,10 +3224,9 @@ run_prema_pecan_trait_ma <- function(
     NULL
   }
   observation_coordinate_data_provided <-
-    identical(pft_assignment_mode, "spatial_observation") &&
-    !is.null(observation_coordinate_data)
+    coordinate_aware_pft_mode && !is.null(observation_coordinate_data)
   observation_coordinate_path_provided <-
-    identical(pft_assignment_mode, "spatial_observation") &&
+    coordinate_aware_pft_mode &&
     !observation_coordinate_data_provided &&
     !is.null(observation_coordinate_file) &&
     length(observation_coordinate_file) == 1L &&
@@ -2054,6 +3256,7 @@ run_prema_pecan_trait_ma <- function(
     pft_coordinate_map = pft_coordinate_map,
     assignment_mode = pft_assignment_mode,
     observation_coordinate_data = observation_coordinate_data,
+    pft_range_buffer_degrees = pft_range_buffer_degrees,
     max_distance_km = max_pft_distance_km
   )
   pft_selection_audit <- attr(selected_try, "pft_selection_audit")
@@ -2065,6 +3268,14 @@ run_prema_pecan_trait_ma <- function(
   observation_coordinate_join_audit <- attr(
     selected_try,
     "observation_coordinate_join_audit"
+  )
+  pft_species_range_audit <- attr(
+    selected_try,
+    "pft_species_range_audit"
+  )
+  pft_reference_points_used <- attr(
+    selected_try,
+    "pft_reference_points_used"
   )
   if ("ErrorRisk" %in% names(selected_try)) {
     selected_try[, ErrorRisk_original_prema := ErrorRisk]
@@ -2094,6 +3305,12 @@ run_prema_pecan_trait_ma <- function(
     excluded_ambiguous_rows,
     file.path(canonical_dir, "excluded_ambiguous_rows.csv")
   )
+  if (identical(pft_assignment_mode, "pft_range_species")) {
+    data.table::fwrite(
+      excluded_ambiguous_rows,
+      file.path(canonical_dir, "excluded_outside_range_rows.csv")
+    )
+  }
   data.table::fwrite(
     observation_pft_assignment_audit,
     file.path(canonical_dir, "observation_pft_assignment_audit.csv")
@@ -2106,6 +3323,18 @@ run_prema_pecan_trait_ma <- function(
     unit_conversion_audit,
     file.path(canonical_dir, "unit_conversion_audit.csv")
   )
+  if (!is.null(pft_species_range_audit)) {
+    data.table::fwrite(
+      pft_species_range_audit,
+      file.path(canonical_dir, "pft_species_range_audit.csv")
+    )
+  }
+  if (!is.null(pft_reference_points_used)) {
+    data.table::fwrite(
+      pft_reference_points_used,
+      file.path(canonical_dir, "pft_reference_points_used.csv")
+    )
+  }
 
   target_result <- build_prema_pecan_target_observations(
     canonical_try = canonical_try,
@@ -2113,18 +3342,57 @@ run_prema_pecan_trait_ma <- function(
     seed = seed,
     context_overrides = context_overrides
   )
+  prior_split <- split_prema_prior_species(
+    target_observations = target_result$observations,
+    prior_species_fraction = prior_species_fraction,
+    fraction_rule_min_species = prior_fraction_rule_min_species,
+    no_holdout_max_species = prior_no_holdout_max_species,
+    seed = seed + 1L
+  )
   target_formatted <- prema_observations_to_trait_data(
-    target_result$observations
+    prior_split$likelihood_observations
   )
   try_ma_long <- target_formatted$try_ma_long
   trait.data <- target_formatted$trait.data
+
+  # The compatibility filename now contains the observations actually used by
+  # the MA likelihood. The unsplit candidates are saved with an explicit
+  # "_all" suffix, and prior-source rows are saved separately.
   saveRDS(
-    target_result$observations,
+    prior_split$likelihood_observations,
     file.path(target_dir, "prema_pecan_target_observations.rds")
   )
   data.table::fwrite(
-    target_result$observations,
+    prior_split$likelihood_observations,
     file.path(target_dir, "prema_pecan_target_observations.csv")
+  )
+  saveRDS(
+    target_result$observations,
+    file.path(target_dir, "prema_pecan_target_observations_all.rds")
+  )
+  data.table::fwrite(
+    target_result$observations,
+    file.path(target_dir, "prema_pecan_target_observations_all.csv")
+  )
+  saveRDS(
+    prior_split$prior_source_observations,
+    file.path(target_dir, "prior_species_source_observations.rds")
+  )
+  data.table::fwrite(
+    prior_split$prior_source_observations,
+    file.path(target_dir, "prior_species_source_observations.csv")
+  )
+  data.table::fwrite(
+    prior_split$prior_species_values,
+    file.path(target_dir, "prior_species_values.csv")
+  )
+  data.table::fwrite(
+    prior_split$species_assignments,
+    file.path(target_dir, "prior_species_assignments.csv")
+  )
+  data.table::fwrite(
+    prior_split$trait_audit,
+    file.path(target_dir, "prior_species_split_audit.csv")
   )
   data.table::fwrite(
     target_result$target_audit,
@@ -2142,31 +3410,79 @@ run_prema_pecan_trait_ma <- function(
   )
 
   ma_traits <- names(trait.data)
-  prior_registry <- prema_target_prior_registry(
-    ma_traits,
-    target_result$writer_contract
+  prior_preflight_jagged <- lapply(
+    trait.data,
+    PEcAn.MA::jagify,
+    use_ghs = FALSE
   )
-  prior.distns <- make_prior_distns_from_trait_data(
-    trait.data = trait.data,
-    sample_fraction = 0.05,
-    min_sample_n = 1L,
-    max_sample_n = 2L,
-    width_multiplier = 10,
-    relative_sd_floor = 0.10,
-    seed = seed + 1L,
+  empty_preflight_traits <- names(prior_preflight_jagged)[
+    vapply(prior_preflight_jagged, nrow, integer(1)) == 0L
+  ]
+  if (length(empty_preflight_traits) > 0L) {
+    stop(
+      "No observations remain after PEcAn jagify for: ",
+      paste(empty_preflight_traits, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  prior_preflight_jagged_summary <- data.table::rbindlist(
+    lapply(seq_along(prior_preflight_jagged), function(trait_index) {
+      one_trait <- prior_preflight_jagged[[trait_index]]
+      y_value <- suppressWarnings(as.numeric(one_trait[, "Y"]))
+      data.table::data.table(
+        pecan_trait = names(prior_preflight_jagged)[[trait_index]],
+        n_jagged_rows = length(y_value),
+        jagged_min = min(y_value),
+        jagged_median = stats::median(y_value),
+        jagged_max = max(y_value)
+      )
+    }),
+    use.names = TRUE,
+    fill = TRUE
+  )
+  prior_bundle <- make_prema_species_prior_distns(
+    prior_species_values = prior_split$prior_species_values,
+    likelihood_observations = prior_split$likelihood_observations,
+    likelihood_jagged_summary = prior_preflight_jagged_summary,
+    targets = ma_traits,
+    writer_contract = target_result$writer_contract,
     unit_map = unit_map,
-    prior_registry = prior_registry,
-    positive_distribution = "lnorm",
-    domain_action = "stop"
+    seed = seed + 2L,
+    width_multiplier = 10,
+    relative_sd_floor = 0.10
   )
+  prior.distns <- prior_bundle$prior.distns
+  prior_registry <- prior_bundle$prior_registry
+  prior_trait.data <- prior_bundle$prior_trait.data
   save(
     prior.distns,
     file = file.path(target_dir, "prior.distns.Rdata"),
     compress = FALSE
   )
+  save(
+    prior_trait.data,
+    file = file.path(target_dir, "prior_species_trait.data.Rdata"),
+    compress = FALSE
+  )
   data.table::fwrite(
     prior_registry,
     file.path(target_dir, "prior_registry_targets.csv")
+  )
+  data.table::fwrite(
+    attr(prior.distns, "prior_parameter_audit"),
+    file.path(target_dir, "prior_parameter_audit.csv")
+  )
+  data.table::fwrite(
+    prior_bundle$prior_compatibility_audit,
+    file.path(target_dir, "prior_compatibility_audit.csv")
+  )
+  data.table::fwrite(
+    prior_preflight_jagged_summary,
+    file.path(target_dir, "prior_preflight_jagged_summary.csv")
+  )
+  saveRDS(
+    attr(prior.distns, "prior_sampling_configuration"),
+    file.path(target_dir, "prior_sampling_configuration.rds")
   )
 
   ma_result <- run_pecan_ma_parallel(
@@ -2226,7 +3542,7 @@ run_prema_pecan_trait_ma <- function(
     writer_contract = target_result$writer_contract,
     pft_name = pft_name,
     n_draws = as.integer(n_output_draws),
-    seed = seed + 2L,
+    seed = seed + 3L,
     include_site_variability = include_site_variability_in_samples
   )
   saveRDS(
@@ -2254,6 +3570,13 @@ run_prema_pecan_trait_ma <- function(
     sample_mode = sample_mode
   )
 
+  audit_scalar <- function(name, default = NA) {
+    if (name %in% names(pft_selection_audit)) {
+      pft_selection_audit[[name]][[1L]]
+    } else {
+      default
+    }
+  }
   pipeline_summary <- data.table::data.table(
     pipeline_version = PREMA_PECAN_PIPELINE_VERSION,
     pft = pft_name,
@@ -2262,6 +3585,34 @@ run_prema_pecan_trait_ma <- function(
     sample_mode = sample_mode,
     ma_qc_policy = ma_qc$classification_policy,
     pft_assignment_mode = pft_assignment_mode,
+    pft_range_buffer_degrees = audit_scalar(
+      "pft_range_buffer_degrees",
+      NA_real_
+    ),
+    n_pft_reference_points = audit_scalar(
+      "target_reference_points",
+      NA_integer_
+    ),
+    n_candidate_pft_species = audit_scalar(
+      "target_candidate_species",
+      NA_integer_
+    ),
+    n_selected_pft_species = audit_scalar(
+      "selected_species",
+      data.table::uniqueN(selected_try$AccSpeciesID)
+    ),
+    n_selected_in_range_species = audit_scalar(
+      "selected_in_range_species",
+      NA_integer_
+    ),
+    n_selected_no_coordinate_species = audit_scalar(
+      "selected_no_coordinate_species",
+      NA_integer_
+    ),
+    n_excluded_outside_range_species = audit_scalar(
+      "excluded_outside_range_species",
+      NA_integer_
+    ),
     n_selected_unique_species_rows =
       pft_selection_audit$selected_unique_species_rows,
     n_selected_shared_species_rows =
@@ -2271,6 +3622,29 @@ run_prema_pecan_trait_ma <- function(
       pft_selection_audit$excluded_unassigned_candidate_rows,
     n_canonical_try_rows = nrow(canonical_try),
     n_prema_target_rows = nrow(target_result$observations),
+    n_likelihood_target_rows =
+      nrow(prior_split$likelihood_observations),
+    n_prior_source_rows =
+      nrow(prior_split$prior_source_observations),
+    n_prior_species_used_across_traits = sum(
+      prior_split$trait_audit$n_prior_species_used
+    ),
+    n_prior_species_randomly_selected_across_traits = sum(
+      prior_split$trait_audit$n_prior_species_selected_randomly
+    ),
+    n_prior_species_removed_from_likelihood = sum(
+      prior_split$trait_audit$n_prior_species_removed_from_likelihood
+    ),
+    n_traits_with_random_prior_species_sample = prior_split$trait_audit[
+      n_prior_species_selected_randomly > 0L, .N
+    ],
+    n_traits_no_random_prior_sample_le2 = prior_split$trait_audit[
+      selection_rule == "ALL_SPECIES_PRIOR_NO_RANDOM_SAMPLE_LE2", .N
+    ],
+    n_priors_adjusted_for_likelihood_compatibility =
+      prior_bundle$prior_compatibility_audit[
+        adjusted_for_likelihood == TRUE, .N
+      ],
     n_targets_using_multiple_routes = target_result$target_audit[
       primary_source == "MULTI_ROUTE", .N
     ],
@@ -2308,9 +3682,7 @@ run_prema_pecan_trait_ma <- function(
         mustWork = TRUE
       ),
       pft_assignment_mode = pft_assignment_mode,
-      pft_coordinate_map_file = if (
-        identical(pft_assignment_mode, "spatial_observation")
-      ) {
+      pft_coordinate_map_file = if (coordinate_aware_pft_mode) {
         normalizePath(pft_coordinate_map_file, mustWork = TRUE)
       } else {
         NA_character_
@@ -2333,6 +3705,13 @@ run_prema_pecan_trait_ma <- function(
       } else {
         "TRY_INPUT_COLUMNS_ONLY"
       },
+      pft_range_buffer_degrees = if (
+        identical(pft_assignment_mode, "pft_range_species")
+      ) {
+        as.numeric(pft_range_buffer_degrees)
+      } else {
+        NA_real_
+      },
       max_pft_distance_km = if (
         identical(pft_assignment_mode, "spatial_observation")
       ) {
@@ -2340,6 +3719,12 @@ run_prema_pecan_trait_ma <- function(
       } else {
         NA_real_
       },
+      prior_species_fraction = as.numeric(prior_species_fraction),
+      prior_fraction_rule_min_species =
+        as.integer(prior_fraction_rule_min_species),
+      prior_no_holdout_max_species =
+        as.integer(prior_no_holdout_max_species),
+      prior_species_summary = "median",
       iterations = as.integer(iterations),
       workers = as.integer(workers),
       random = TRUE,
@@ -2350,9 +3735,17 @@ run_prema_pecan_trait_ma <- function(
       seed = as.integer(seed)
     ),
     pft_selection_audit = pft_selection_audit,
+    pft_species_range_audit = pft_species_range_audit,
+    pft_reference_points_used = pft_reference_points_used,
     observation_pft_assignment_audit = observation_pft_assignment_audit,
     observation_coordinate_join_audit = observation_coordinate_join_audit,
     target_audit = target_result$target_audit,
+    prior_species_audit = prior_split$trait_audit,
+    prior_species_assignments = prior_split$species_assignments,
+    prior_species_values = prior_split$prior_species_values,
+    prior_sampling_configuration = prior_split$configuration,
+    prior_compatibility_audit =
+      prior_bundle$prior_compatibility_audit,
     ma_result = ma_result,
     ma_qc = ma_qc,
     site_variability_summary = site_variability_summary,
@@ -2370,14 +3763,29 @@ run_prema_pecan_trait_ma <- function(
     "\nPre-MA PEcAn-target pipeline complete.",
     "\nPFT: ", pft_name,
     "\nPFT assignment mode: ", pft_assignment_mode,
-    "\nShared-species TRY rows retained: ",
-    pipeline_summary$n_selected_shared_species_rows,
+    "\nEligible PFT species: ",
+    pipeline_summary$n_selected_pft_species,
+    "\nSpecies included because all coordinates were missing: ",
+    pipeline_summary$n_selected_no_coordinate_species,
+    "\nSpecies excluded because known coordinates were outside range: ",
+    pipeline_summary$n_excluded_outside_range_species,
     "\nTargets entering random-effect MA: ", length(ma_traits),
+    "\nPrior species randomly sampled across target-specific fits: ",
+    pipeline_summary$n_prior_species_randomly_selected_across_traits,
+    "\nPrior species removed from likelihood: ",
+    pipeline_summary$n_prior_species_removed_from_likelihood,
+    "\nTargets with <=2 species and no random prior sample: ",
+    pipeline_summary$n_traits_no_random_prior_sample_le2,
+    "\nPriors widened for PEcAn likelihood-median compatibility: ",
+    pipeline_summary$n_priors_adjusted_for_likelihood_compatibility,
+    "\nQC policy: ", ma_qc$classification_policy,
     "\nQC PASS: ", length(ma_qc$passed_traits),
     "\nTargets using sd.site in new-site draws: ",
     pipeline_summary$n_targets_using_site_variability,
     "\nDefault-only fallback targets: ",
     pipeline_summary$n_default_only_targets,
+    "\nPrior split audit: ",
+    file.path(target_dir, "prior_species_split_audit.csv"),
     "\nPEcAn samples: ", file.path(export_dir, "samples.Rdata"),
     "\nOutput: ", output_dir
   )

@@ -1,6 +1,7 @@
 # =============================================================================
-# RStudio caller: TRY -> 21 PEcAn target observations -> random-effect MA
-#                 -> QC -> PEcAn samples (no pecan.xml is read)
+# RStudio caller: PFT-range species -> 21 PEcAn target observations ->
+#                 species-sampled priors -> random-effect MA -> QC ->
+#                 PEcAn samples (no pecan.xml is read)
 # =============================================================================
 
 options(stringsAsFactors = FALSE)
@@ -13,16 +14,30 @@ options(stringsAsFactors = FALSE)
 PFT_NAME <- "Evergreen_Broadleaf_Forest"
 PFT_NAME <- trimws(PFT_NAME)
 
-# Default: select by species membership only. All TRY observations from a
-# species listed for this PFT are retained, even if the species is shared with
-# other PFTs, coordinates are missing, or the nearest reference point is more
-# than 250 km away.
-PFT_ASSIGNMENT_MODE <- "share_species"
+# Default: start from species listed for this PFT in pftspecies. Retain a
+# species when at least one valid TRY coordinate falls inside any +/-1 degree
+# box centered on a target-PFT point. A species with no valid coordinates is
+# included explicitly. Once eligible, all trait rows for that species remain.
+PFT_ASSIGNMENT_MODE <- "pft_range_species"
+PFT_RANGE_BUFFER_DEGREES <- 1
+
+# Prior species are selected separately for each PEcAn trait. For >=20
+# species, ceiling(10%) are sampled; for 3-19 species, one is sampled; for
+# <=2 species no random sampling is done and all available species are used.
+# Selected species remain in the likelihood, and the overlap is audited.
+PRIOR_SPECIES_FRACTION <- 0.10
+PRIOR_FRACTION_RULE_MIN_SPECIES <- 20L
+PRIOR_NO_HOLDOUT_MAX_SPECIES <- 2L
 
 OUTPUT_DIR <- file.path(
   "/projectnb/dietzelab/guYANG/TRY_meta_analysis",
   PFT_NAME,
-  paste0("prema_pecan_random_site_", PFT_ASSIGNMENT_MODE)
+  paste0(
+    "prema_pecan_random_site_", PFT_ASSIGNMENT_MODE, "_",
+    format(PFT_RANGE_BUFFER_DEGREES, trim = TRUE), "deg_",
+    "prior_species_", format(100 * PRIOR_SPECIES_FRACTION, trim = TRUE),
+    "pct"
+  )
 )
 
 PFTSPECIES_RDATA <- paste0(
@@ -35,15 +50,17 @@ TRYDAT_USE_SPECIES_RDATA <- paste0(
   "trydat_use_species.RData"
 )
 
-# Optional legacy mode: set PFT_ASSIGNMENT_MODE to "spatial_observation" to
-# assign ambiguous-species observations using the reference-point file below.
+# Required by pft_range_species and spatial_observation. In the default mode,
+# every point belonging to PFT_NAME is the center of a +/- degree rectangle.
 PFT_COORDINATE_MAP_FILE <- paste0(
   "/projectnb/dietzelab/guYANG/",
   "SIPNET_Model_Calibration/Final_PFT_assignment_v4/",
   "final_8000_sites_with_final_pft_v4.csv"
 )
 
-# Used only in spatial_observation mode. It is ignored in share_species mode.
+# Optional in both coordinate-aware modes. If absent, TRY Latitude/Longitude
+# columns are used. Candidate species with no valid coordinates are included
+# by the pft_range_species fallback.
 TRY_OBSERVATION_COORDINATE_FILE <- file.path(
   "/projectnb/dietzelab/guYANG/TRY_meta_analysis",
   "try_observation_coordinates.rds"
@@ -57,9 +74,9 @@ TRY_OBSERVATION_COORDINATE_FILE <- file.path(
 MA_ITERATIONS <- 3000L
 MA_WORKERS <- 2L
 N_OUTPUT_DRAWS <- 1000L
-RANDOM_SEED <- 20260903L
-# Safe because OUTPUT_DIR includes PFT_ASSIGNMENT_MODE, so spatial-selection
-# checkpoints cannot be reused accidentally by a share-species run.
+RANDOM_SEED <- 20260904L
+# Safe because OUTPUT_DIR records range mode, buffer, and prior fraction, so
+# checkpoints from older species-selection or row-prior runs are not reused.
 RESUME_EXISTING_TRAIT_RUNS <- TRUE
 PFT_MAX_DISTANCE_KM <- 250
 
@@ -146,17 +163,25 @@ if (length(PFT_NAME) != 1L || is.na(PFT_NAME) || !nzchar(trimws(PFT_NAME))) {
 if (length(OUTPUT_DIR) != 1L || is.na(OUTPUT_DIR) || !nzchar(OUTPUT_DIR)) {
   stop("OUTPUT_DIR must be one non-empty path.", call. = FALSE)
 }
-if (!PFT_ASSIGNMENT_MODE %in% c("share_species", "spatial_observation")) {
+if (!PFT_ASSIGNMENT_MODE %in% c(
+  "pft_range_species", "share_species", "spatial_observation"
+)) {
   stop(
-    "PFT_ASSIGNMENT_MODE must be share_species or spatial_observation.",
+    paste(
+      "PFT_ASSIGNMENT_MODE must be pft_range_species,",
+      "share_species, or spatial_observation."
+    ),
     call. = FALSE
   )
 }
+COORDINATE_AWARE_PFT_MODE <- PFT_ASSIGNMENT_MODE %in%
+  c("pft_range_species", "spatial_observation")
+
 required_input_files <- c(
   PFTSPECIES_RDATA,
   TRYDAT_USE_SPECIES_RDATA
 )
-if (identical(PFT_ASSIGNMENT_MODE, "spatial_observation")) {
+if (COORDINATE_AWARE_PFT_MODE) {
   required_input_files <- c(
     required_input_files,
     PFT_COORDINATE_MAP_FILE
@@ -168,11 +193,16 @@ for (input_file in required_input_files) {
   }
 }
 
-# Coordinates are intentionally unused in share_species mode.
+# Observation coordinates are optional. In pft_range_species mode, species
+# with no valid coordinates remain eligible by the explicit fallback rule.
 TRY_OBSERVATION_COORDINATE_DATA <- NULL
-TRY_OBSERVATION_COORDINATE_SOURCE <- "NOT_USED_SHARE_SPECIES"
+TRY_OBSERVATION_COORDINATE_SOURCE <- if (COORDINATE_AWARE_PFT_MODE) {
+  "TRY_INPUT_COLUMNS_OR_NO_COORDINATE_SPECIES_FALLBACK"
+} else {
+  "NOT_USED_SHARE_SPECIES"
+}
 
-if (identical(PFT_ASSIGNMENT_MODE, "spatial_observation")) {
+if (COORDINATE_AWARE_PFT_MODE) {
   TRY_OBSERVATION_COORDINATE_SOURCE <- "TRY_INPUT_COLUMNS_ONLY"
   if (
     exists(
@@ -214,7 +244,7 @@ coordinate_file_requested <-
   !is.na(TRY_OBSERVATION_COORDINATE_FILE) &&
   nzchar(trimws(TRY_OBSERVATION_COORDINATE_FILE))
 
-if (identical(PFT_ASSIGNMENT_MODE, "spatial_observation") &&
+if (COORDINATE_AWARE_PFT_MODE &&
     is.null(TRY_OBSERVATION_COORDINATE_DATA) &&
     coordinate_file_requested &&
     file.exists(TRY_OBSERVATION_COORDINATE_FILE)) {
@@ -225,7 +255,7 @@ if (identical(PFT_ASSIGNMENT_MODE, "spatial_observation") &&
     TRY_OBSERVATION_COORDINATE_FILE
   )
 } else if (
-  identical(PFT_ASSIGNMENT_MODE, "spatial_observation") &&
+  COORDINATE_AWARE_PFT_MODE &&
   is.null(TRY_OBSERVATION_COORDINATE_DATA) &&
   coordinate_file_requested &&
   !file.exists(TRY_OBSERVATION_COORDINATE_FILE)
@@ -234,8 +264,17 @@ if (identical(PFT_ASSIGNMENT_MODE, "spatial_observation") &&
     "Optional coordinate file was not found: ",
     TRY_OBSERVATION_COORDINATE_FILE,
     "\nThe pipeline will check TRY's own Latitude/Longitude columns. ",
-    "Ambiguous observations still lacking coordinates will be excluded ",
-    "and audited; the run stops only if no target-PFT observations remain."
+    if (identical(PFT_ASSIGNMENT_MODE, "pft_range_species")) {
+      paste(
+        "A candidate species with no valid coordinates will be included;",
+        "a species with known coordinates only outside the range will be excluded."
+      )
+    } else {
+      paste(
+        "Ambiguous observations still lacking coordinates will be excluded",
+        "and audited."
+      )
+    }
   )
 }
 
@@ -248,6 +287,8 @@ message("============================================================")
 message("PFT: ", PFT_NAME)
 message("Output: ", OUTPUT_DIR)
 message("PFT assignment mode: ", PFT_ASSIGNMENT_MODE)
+message("PFT range buffer (degrees): ", PFT_RANGE_BUFFER_DEGREES)
+message("Prior species fraction: ", PRIOR_SPECIES_FRACTION)
 message("Random site effects: TRUE")
 message("PEcAn export mode: ", PECAN_SAMPLE_MODE)
 message("TRY observation coordinate source: ",
@@ -261,11 +302,15 @@ prema_result <- run_prema_pecan_trait_ma(
   pftspecies_rdata = PFTSPECIES_RDATA,
   trydat_use_species_rdata = TRYDAT_USE_SPECIES_RDATA,
   pft_coordinate_map_file = if (
-    identical(PFT_ASSIGNMENT_MODE, "spatial_observation")
+    COORDINATE_AWARE_PFT_MODE
   ) PFT_COORDINATE_MAP_FILE else NULL,
   pft_assignment_mode = PFT_ASSIGNMENT_MODE,
   observation_coordinate_file = TRY_OBSERVATION_COORDINATE_FILE_USE,
   observation_coordinate_data = TRY_OBSERVATION_COORDINATE_DATA,
+  pft_range_buffer_degrees = PFT_RANGE_BUFFER_DEGREES,
+  prior_species_fraction = PRIOR_SPECIES_FRACTION,
+  prior_fraction_rule_min_species = PRIOR_FRACTION_RULE_MIN_SPECIES,
+  prior_no_holdout_max_species = PRIOR_NO_HOLDOUT_MAX_SPECIES,
   iterations = MA_ITERATIONS,
   workers = MA_WORKERS,
   n_output_draws = N_OUTPUT_DRAWS,
@@ -301,6 +346,9 @@ print(
 
 message(
   "\nOpen in RStudio with:",
+  "\nView(prema_result$pft_species_range_audit)",
+  "\nView(prema_result$prior_species_audit)",
+  "\nView(prema_result$prior_compatibility_audit)",
   "\nView(prema_result$site_variability_summary)",
   "\nView(prema_result$posterior_samples_21$metadata_21)",
   "\n\nMain random-effect MA result:",

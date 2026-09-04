@@ -10,15 +10,19 @@ permissions:
   contents: read
 
 jobs:
-  spatial-pft-and-priors:
+  r-regression-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: r-lib/actions/setup-r@v2
         with:
           use-public-rspm: true
-      - name: Install test dependency
-        run: install.packages("data.table")
+      - name: Install test dependencies
+        run: install.packages(c("data.table", "coda"))
         shell: Rscript {0}
-      - name: Run regression tests
+      - name: Run spatial PFT and prior tests
         run: Rscript tests/test_spatial_pft_and_priors.R
+      - name: Run PFT range and species prior tests
+        run: Rscript tests/test_pft_range_species_and_prior_split.R
+      - name: Run minimum bridge QC tests
+        run: Rscript tests/test_minimum_bridge_ma_qc.R
