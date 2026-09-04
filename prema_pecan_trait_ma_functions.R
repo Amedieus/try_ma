@@ -1930,6 +1930,7 @@ split_prema_prior_species <- function(
 make_prema_species_prior_distns <- function(
     prior_species_values,
     likelihood_observations,
+    likelihood_jagged_summary,
     targets,
     writer_contract,
     unit_map,
@@ -1965,6 +1966,80 @@ make_prema_species_prior_distns <- function(
       call. = FALSE
     )
   }
+  targets <- trimws(as.character(targets))
+  if (
+    length(targets) == 0L ||
+    anyNA(targets) ||
+    any(!nzchar(targets))
+  ) {
+    stop("targets must contain non-empty trait names.", call. = FALSE)
+  }
+  targets <- sort(unique(targets))
+
+  jagged_summary <- data.table::copy(
+    data.table::as.data.table(likelihood_jagged_summary)
+  )
+  required_jagged <- c(
+    "pecan_trait", "n_jagged_rows",
+    "jagged_min", "jagged_median", "jagged_max"
+  )
+  missing_jagged <- setdiff(required_jagged, names(jagged_summary))
+  if (length(missing_jagged) > 0L) {
+    stop(
+      "likelihood_jagged_summary is missing: ",
+      paste(missing_jagged, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  jagged_summary[, pecan_trait := trimws(as.character(pecan_trait))]
+  if (
+    anyNA(jagged_summary$pecan_trait) ||
+    any(!nzchar(jagged_summary$pecan_trait)) ||
+    anyDuplicated(jagged_summary$pecan_trait)
+  ) {
+    stop(
+      "likelihood_jagged_summary must have one uniquely named row per target.",
+      call. = FALSE
+    )
+  }
+  for (numeric_column in required_jagged[-1L]) {
+    jagged_summary[
+      ,
+      (numeric_column) := suppressWarnings(
+        as.numeric(get(numeric_column))
+      )
+    ]
+  }
+  missing_jagged_targets <- setdiff(
+    targets,
+    jagged_summary$pecan_trait
+  )
+  if (length(missing_jagged_targets) > 0L) {
+    stop(
+      "No exact PEcAn jagged likelihood summary for: ",
+      paste(missing_jagged_targets, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  target_jagged_summary <- jagged_summary[
+    pecan_trait %in% targets
+  ]
+  jagged_numeric_matrix <- as.matrix(
+    target_jagged_summary[
+      ,
+      required_jagged[-1L],
+      with = FALSE
+    ]
+  )
+  if (
+    any(!is.finite(jagged_numeric_matrix)) ||
+    any(target_jagged_summary$n_jagged_rows < 1)
+  ) {
+    stop(
+      "Exact PEcAn jagged likelihood summaries must be finite and non-empty.",
+      call. = FALSE
+    )
+  }
   if (
     length(pecan_consistency_tail) != 1L ||
     !is.finite(pecan_consistency_tail) ||
@@ -1984,7 +2059,6 @@ make_prema_species_prior_distns <- function(
   likelihood[, species_key := trimws(as.character(species_key))]
   likelihood[, target_value := suppressWarnings(as.numeric(target_value))]
 
-  targets <- sort(unique(trimws(as.character(targets))))
   missing_prior_targets <- setdiff(targets, unique(values$pecan_trait))
   if (length(missing_prior_targets) > 0L) {
     stop(
@@ -2075,7 +2149,9 @@ make_prema_species_prior_distns <- function(
     }
 
     rule <- prior_registry[trait == trait_i][1L]
-    likelihood_median <- stats::median(likelihood_i)
+    jagged_i <- jagged_summary[pecan_trait == trait_i][1L]
+    raw_likelihood_median <- stats::median(likelihood_i)
+    likelihood_median <- as.numeric(jagged_i$jagged_median)
     likelihood_min <- min(likelihood_i)
     likelihood_max <- max(likelihood_i)
     prior_center <- stats::median(prior_values_i)
@@ -2372,12 +2448,18 @@ make_prema_species_prior_distns <- function(
         unique(values[pecan_trait == trait_i, species_key]) %in%
           unique(likelihood[pecan_trait == trait_i, species_key])
       ),
-      n_likelihood_rows = length(likelihood_i),
+      n_raw_likelihood_rows = length(likelihood_i),
+      n_pecan_jagged_rows = as.integer(jagged_i$n_jagged_rows),
       prior_species_center = prior_center,
       prior_species_sd = prior_species_sd,
-      likelihood_min = likelihood_min,
+      raw_likelihood_min = likelihood_min,
+      raw_likelihood_median = raw_likelihood_median,
+      raw_likelihood_max = likelihood_max,
+      pecan_jagged_min = as.numeric(jagged_i$jagged_min),
       likelihood_median = likelihood_median,
-      likelihood_max = likelihood_max,
+      likelihood_median_source =
+        "median(PEcAn.MA::jagify(trait.data, use_ghs=FALSE)$Y)",
+      pecan_jagged_max = as.numeric(jagged_i$jagged_max),
       distn = distn,
       parama_before_preflight = parama_before,
       paramb_before_preflight = paramb_before,
@@ -2423,7 +2505,8 @@ make_prema_species_prior_distns <- function(
   prior_configuration$species_summary <- "one median per selected species"
   prior_configuration$pecan_consistency_tail <-
     as.numeric(pecan_consistency_tail)
-  prior_configuration$preflight_point <- "likelihood median"
+  prior_configuration$preflight_point <-
+    "exact median of PEcAn.MA::jagify(..., use_ghs=FALSE)$Y"
   prior_configuration$preflight_rule <-
     "same CDF rule used by PEcAn.MA::meta_analysis_standalone"
   prior_configuration$bounded_prior_support_preserved <- TRUE
@@ -3327,9 +3410,40 @@ run_prema_pecan_trait_ma <- function(
   )
 
   ma_traits <- names(trait.data)
+  prior_preflight_jagged <- lapply(
+    trait.data,
+    PEcAn.MA::jagify,
+    use_ghs = FALSE
+  )
+  empty_preflight_traits <- names(prior_preflight_jagged)[
+    vapply(prior_preflight_jagged, nrow, integer(1)) == 0L
+  ]
+  if (length(empty_preflight_traits) > 0L) {
+    stop(
+      "No observations remain after PEcAn jagify for: ",
+      paste(empty_preflight_traits, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  prior_preflight_jagged_summary <- data.table::rbindlist(
+    lapply(seq_along(prior_preflight_jagged), function(trait_index) {
+      one_trait <- prior_preflight_jagged[[trait_index]]
+      y_value <- suppressWarnings(as.numeric(one_trait[, "Y"]))
+      data.table::data.table(
+        pecan_trait = names(prior_preflight_jagged)[[trait_index]],
+        n_jagged_rows = length(y_value),
+        jagged_min = min(y_value),
+        jagged_median = stats::median(y_value),
+        jagged_max = max(y_value)
+      )
+    }),
+    use.names = TRUE,
+    fill = TRUE
+  )
   prior_bundle <- make_prema_species_prior_distns(
     prior_species_values = prior_split$prior_species_values,
     likelihood_observations = prior_split$likelihood_observations,
+    likelihood_jagged_summary = prior_preflight_jagged_summary,
     targets = ma_traits,
     writer_contract = target_result$writer_contract,
     unit_map = unit_map,
@@ -3361,6 +3475,10 @@ run_prema_pecan_trait_ma <- function(
   data.table::fwrite(
     prior_bundle$prior_compatibility_audit,
     file.path(target_dir, "prior_compatibility_audit.csv")
+  )
+  data.table::fwrite(
+    prior_preflight_jagged_summary,
+    file.path(target_dir, "prior_preflight_jagged_summary.csv")
   )
   saveRDS(
     attr(prior.distns, "prior_sampling_configuration"),
