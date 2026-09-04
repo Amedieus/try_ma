@@ -245,9 +245,20 @@ writer_contract_test <- data.table(
   pecan_trait = prior_targets,
   pecan_input_unit = "test positive unit"
 )
+prior_jagged_summary_test <- prior_split_test$likelihood_observations[
+  ,
+  .(
+    n_jagged_rows = .N,
+    jagged_min = min(target_value),
+    jagged_median = median(target_value),
+    jagged_max = max(target_value)
+  ),
+  by = pecan_trait
+]
 prior_bundle_test <- make_prema_species_prior_distns(
   prior_species_values = prior_split_test$prior_species_values,
   likelihood_observations = prior_split_test$likelihood_observations,
+  likelihood_jagged_summary = prior_jagged_summary_test,
   targets = prior_targets,
   writer_contract = writer_contract_test,
   unit_map = data.table(),
@@ -294,9 +305,26 @@ domain_contract <- data.table(
     "day-1"
   )
 )
+domain_jagged_summary <- domain_likelihood[
+  ,
+  .(
+    n_jagged_rows = .N,
+    jagged_min = min(target_value),
+    jagged_median = median(target_value),
+    jagged_max = max(target_value)
+  ),
+  by = pecan_trait
+]
+# Deliberately differ from the raw-row median to prove that the injected
+# PEcAn-jagged statistic, not the raw target-row median, controls preflight.
+domain_jagged_summary[
+  pecan_trait == "SLA",
+  jagged_median := 950
+]
 domain_bundle <- make_prema_species_prior_distns(
   prior_species_values = domain_prior_values,
   likelihood_observations = domain_likelihood,
+  likelihood_jagged_summary = domain_jagged_summary,
   targets = domain_contract$pecan_trait,
   writer_contract = domain_contract,
   unit_map = data.table(),
@@ -319,6 +347,8 @@ stopifnot(
   all(domain_audit$likelihood_median_cdf_after >= 0.025),
   all(domain_audit$likelihood_median_cdf_after <= 0.975),
   all(domain_audit$pecan_preflight_resolved),
+  domain_audit[trait == "SLA", raw_likelihood_median] == 1000,
+  domain_audit[trait == "SLA", likelihood_median] == 950,
   domain_audit[trait == "SLA", adjusted_for_likelihood]
 )
 
@@ -339,6 +369,7 @@ changed_prior_values[
 changed_domain_bundle <- make_prema_species_prior_distns(
   prior_species_values = changed_prior_values,
   likelihood_observations = domain_likelihood,
+  likelihood_jagged_summary = domain_jagged_summary,
   targets = domain_contract$pecan_trait,
   writer_contract = domain_contract,
   unit_map = data.table(),
