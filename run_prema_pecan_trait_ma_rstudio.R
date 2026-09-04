@@ -1,6 +1,6 @@
 # =============================================================================
 # RStudio caller: PFT-range species -> 21 PEcAn target observations ->
-#                 species-held-out priors -> random-effect MA -> QC ->
+#                 species-sampled priors -> random-effect MA -> QC ->
 #                 PEcAn samples (no pecan.xml is read)
 # =============================================================================
 
@@ -21,9 +21,10 @@ PFT_NAME <- trimws(PFT_NAME)
 PFT_ASSIGNMENT_MODE <- "pft_range_species"
 PFT_RANGE_BUFFER_DEGREES <- 1
 
-# Prior split is done separately for each PEcAn trait. For >=20 species,
-# ceiling(10%) are held out; for 3-19 species, one is held out; for <=2 species
-# none is held out and the overlap is explicitly recorded in the audit.
+# Prior species are selected separately for each PEcAn trait. For >=20
+# species, ceiling(10%) are sampled; for 3-19 species, one is sampled; for
+# <=2 species no random sampling is done and all available species are used.
+# Selected species remain in the likelihood, and the overlap is audited.
 PRIOR_SPECIES_FRACTION <- 0.10
 PRIOR_FRACTION_RULE_MIN_SPECIES <- 20L
 PRIOR_NO_HOLDOUT_MAX_SPECIES <- 2L
@@ -347,6 +348,7 @@ message(
   "\nOpen in RStudio with:",
   "\nView(prema_result$pft_species_range_audit)",
   "\nView(prema_result$prior_species_audit)",
+  "\nView(prema_result$prior_compatibility_audit)",
   "\nView(prema_result$site_variability_summary)",
   "\nView(prema_result$posterior_samples_21$metadata_21)",
   "\n\nMain random-effect MA result:",
