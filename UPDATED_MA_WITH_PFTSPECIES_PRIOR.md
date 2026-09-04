@@ -66,8 +66,9 @@ created by the bridge. A proxy target may contain a secondary component paired
 from another species under the deliberately permissive secondary-source rule.
 Therefore this workflow does not claim independent prior/likelihood data.
 
-Before JAGS starts, the workflow reproduces PEcAn.MA's likelihood-median prior
-CDF check. If necessary it widens the prior while keeping the selected-species
+Before JAGS starts, the workflow runs PEcAn.MA::jagify on the same trait.data
+and reproduces PEcAn.MA's exact jagged-Y-median prior CDF check. If necessary
+it widens the prior while keeping the selected-species
 location and physical support. Positive targets use lognormal priors, fractions
 use beta priors, and leafC uses a species-centered uniform prior clipped to
 0-100. Every adjustment is recorded. If a physically bounded prior cannot pass
@@ -82,6 +83,7 @@ Main prior audit files:
 - 02_prema_pecan_observations/prior_species_source_observations.csv
 - 02_prema_pecan_observations/prior_parameter_audit.csv
 - 02_prema_pecan_observations/prior_compatibility_audit.csv
+- 02_prema_pecan_observations/prior_preflight_jagged_summary.csv
 
 prema_pecan_target_observations.rds contains all target observations used by the
 MA likelihood. The identical pre-prior-selection candidate table is retained as
