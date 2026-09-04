@@ -10,7 +10,7 @@ options(stringsAsFactors = FALSE)
 # USER INPUTS: edit these paths for a normal run
 # -----------------------------------------------------------------------------
 
-PFT_NAME <- "Evergreen_Broadleaf_Forest"
+PFT_NAME <- "Permanent_Wetlands"
 PFT_NAME <- trimws(PFT_NAME)
 
 # Default: select by species membership only. All TRY observations from a
@@ -54,7 +54,7 @@ TRY_OBSERVATION_COORDINATE_FILE <- file.path(
 # Optional run controls
 # -----------------------------------------------------------------------------
 
-MA_ITERATIONS <- 3000L
+MA_ITERATIONS <- 15000L
 MA_WORKERS <- 2L
 N_OUTPUT_DRAWS <- 1000L
 RANDOM_SEED <- 20260903L
