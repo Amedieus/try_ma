@@ -1,6 +1,6 @@
 options(stringsAsFactors = FALSE)
 
-PREMA_PECAN_PIPELINE_VERSION <- "2026-09-04.1"
+PREMA_PECAN_PIPELINE_VERSION <- "2026-09-04.2"
 
 
 # =============================================================================
@@ -862,7 +862,13 @@ select_prema_pft_observations <- function(
       selected_shared_species_rows = selected[
         shared_across_pfts == TRUE, .N
       ],
-      selected_spatial_rows = selected[
+      selected_spatial_rows = as.integer(
+        species_range_audit[
+          eligible_species == TRUE,
+          sum(n_in_range_coordinate_rows)
+        ]
+      ),
+      selected_rows_from_in_range_species = selected[
         pft_species_eligibility_reason == "IN_PFT_POINT_BUFFER", .N
       ],
       excluded_ambiguous_rows = nrow(unassigned),
@@ -1652,13 +1658,13 @@ build_prema_pecan_target_observations <- function(
 }
 
 
-# Split each PEcAn target by species before MA.
+# Select species for each target-specific empirical prior before MA.
 #
-# For 3-19 usable species, one species is held out for the prior. For 20 or
-# more, ceiling(prior_species_fraction * n_species) are held out. For one or
-# two species, no species is held out: all remain in the likelihood, and each
-# species median is used to construct a deliberately broad empirical prior.
-# The latter overlap is explicit in the audit instead of being hidden.
+# For 3-19 usable species, one species is sampled. For 20 or more, ceiling of
+# prior_species_fraction times n_species are sampled. For one or two species,
+# no random sample is taken and all available species medians are used.
+# All species remain in the likelihood, preserving the explicitly accepted
+# empirical-Bayes overlap while making it completely visible in the audit.
 split_prema_prior_species <- function(
     target_observations,
     prior_species_fraction = 0.10,
@@ -1735,41 +1741,32 @@ split_prema_prior_species <- function(
     }
 
     if (n_species <= no_holdout_max_species) {
-      held_out_species <- character()
       prior_species <- usable_species
-      selection_rule <- "ALL_SPECIES_PRIOR_NO_HOLDOUT_LE2"
-      prior_likelihood_overlap <- TRUE
+      n_randomly_selected <- 0L
+      selection_rule <- "ALL_SPECIES_PRIOR_NO_RANDOM_SAMPLE_LE2"
     } else {
-      n_holdout <- if (n_species < fraction_rule_min_species) {
+      n_select <- if (n_species < fraction_rule_min_species) {
         1L
       } else {
         as.integer(ceiling(prior_species_fraction * n_species))
       }
-      n_holdout <- min(n_species - 1L, max(1L, n_holdout))
-      held_out_species <- sort(sample(
+      n_select <- min(n_species, max(1L, n_select))
+      prior_species <- sort(sample(
         usable_species,
-        size = n_holdout,
+        size = n_select,
         replace = FALSE
       ))
-      prior_species <- held_out_species
+      n_randomly_selected <- length(prior_species)
       selection_rule <- if (n_species < fraction_rule_min_species) {
-        "HOLDOUT_ONE_SPECIES_LT20"
+        "SAMPLE_ONE_SPECIES_LT20"
       } else {
-        "HOLDOUT_CEILING_10_PERCENT_SPECIES"
+        "SAMPLE_CEILING_10_PERCENT_SPECIES"
       }
-      prior_likelihood_overlap <- FALSE
     }
 
-    likelihood_one <- if (length(held_out_species) == 0L) {
-      data.table::copy(one)
-    } else {
-      data.table::copy(
-        one[
-          is.na(prior_species_key__) |
-            !prior_species_key__ %in% held_out_species
-        ]
-      )
-    }
+    # The user explicitly chose to keep the current empirical-Bayes overlap:
+    # selected prior species are NOT deleted from the MA likelihood.
+    likelihood_one <- data.table::copy(one)
     prior_source_one <- data.table::copy(
       one[prior_species_key__ %in% prior_species]
     )
@@ -1800,17 +1797,14 @@ split_prema_prior_species <- function(
         species_key = prior_species_key__
       )
     ]
-    species_assignments_one[, species_role := if (
-      length(held_out_species) == 0L
-    ) {
-      "PRIOR_AND_LIKELIHOOD_NO_HOLDOUT"
-    } else {
-      data.table::fifelse(
-        species_key %in% held_out_species,
-        "PRIOR_HELD_OUT",
-        "LIKELIHOOD"
+    species_assignments_one[
+      ,
+      species_role := data.table::fifelse(
+        species_key %in% prior_species,
+        "PRIOR_AND_LIKELIHOOD_SELECTED",
+        "LIKELIHOOD_NOT_SELECTED_FOR_PRIOR"
       )
-    }]
+    ]
     species_assignments_one[, selection_rule := selection_rule]
 
     likelihood_rows[[trait_index]] <- likelihood_one
@@ -1821,7 +1815,10 @@ split_prema_prior_species <- function(
       pecan_trait = trait_i,
       n_available_species = n_species,
       n_prior_species_used = length(prior_species),
-      n_prior_species_held_out = length(held_out_species),
+      n_prior_species_selected_randomly = n_randomly_selected,
+      n_prior_species_removed_from_likelihood = 0L,
+      # Compatibility column for older result readers.
+      n_prior_species_held_out = 0L,
       n_likelihood_species = data.table::uniqueN(
         likelihood_one$prior_species_key__,
         na.rm = TRUE
@@ -1834,7 +1831,7 @@ split_prema_prior_species <- function(
       fraction_rule_min_species = fraction_rule_min_species,
       no_holdout_max_species = no_holdout_max_species,
       selection_rule = selection_rule,
-      prior_likelihood_species_overlap = prior_likelihood_overlap
+      prior_likelihood_species_overlap = TRUE
     )
   }
 
@@ -1864,8 +1861,7 @@ split_prema_prior_species <- function(
     fill = TRUE
   )
 
-  # Holding species out can create gaps in the old site IDs. Reindex both
-  # site and observation IDs so PEcAn/JAGS never sees empty factor levels.
+  # Reindex within each independently fitted target so JAGS never sees gaps.
   likelihood[
     ,
     site_id := as.integer(factor(site_key)),
@@ -1887,54 +1883,149 @@ split_prema_prior_species <- function(
       no_holdout_max_species = no_holdout_max_species,
       seed = as.integer(seed),
       species_summary = "median",
-      heldout_species_removed_from_likelihood = TRUE,
+      selected_prior_species_removed_from_likelihood = FALSE,
+      empirical_prior_likelihood_overlap = TRUE,
       sparse_trait_policy =
-        "all_species_prior_and_likelihood_no_holdout_when_le2"
+        "all_species_prior_and_likelihood_no_random_sample_when_le2",
+      split_scope =
+        "anchor_species_of_prebuilt_target_observations"
     )
   )
 }
 
 
+.prema_prior_cdf <- function(point, distn, parama, paramb) {
+  point <- suppressWarnings(as.numeric(point))
+  parama <- suppressWarnings(as.numeric(parama))
+  paramb <- suppressWarnings(as.numeric(paramb))
+  if (
+    length(point) != 1L || length(parama) != 1L ||
+    length(paramb) != 1L || !is.finite(point) ||
+    !is.finite(parama) || !is.finite(paramb)
+  ) {
+    return(NA_real_)
+  }
+
+  switch(
+    as.character(distn),
+    norm = stats::pnorm(point, mean = parama, sd = paramb),
+    lnorm = stats::plnorm(point, meanlog = parama, sdlog = paramb),
+    beta = stats::pbeta(point, shape1 = parama, shape2 = paramb),
+    unif = stats::punif(point, min = parama, max = paramb),
+    stop(
+      "Unsupported PEcAn prior distribution in preflight: ",
+      as.character(distn),
+      call. = FALSE
+    )
+  )
+}
+
+
+# Build a prior from one median per selected prior species, then reproduce
+# PEcAn.MA's likelihood-median consistency check before starting JAGS.
+#
+# Prior parameters are anchored in the selected prior species. Width,
+# concentration, or bounded support is relaxed only when needed so PEcAn.MA
+# will not abort with "inconsistent with priors". Physical support is retained.
 make_prema_species_prior_distns <- function(
     prior_species_values,
+    likelihood_observations,
     targets,
     writer_contract,
     unit_map,
     seed = 20260905L,
     width_multiplier = 10,
-    relative_sd_floor = 0.10
+    relative_sd_floor = 0.10,
+    pecan_consistency_tail = 0.025
 ) {
   .prema_require_packages("data.table")
   .prema_require_functions("make_prior_distns_from_trait_data")
   values <- data.table::copy(
     data.table::as.data.table(prior_species_values)
   )
-  required <- c("pecan_trait", "species_key", "prior_value")
-  missing <- setdiff(required, names(values))
-  if (length(missing) > 0L) {
+  likelihood <- data.table::copy(
+    data.table::as.data.table(likelihood_observations)
+  )
+
+  required_prior <- c("pecan_trait", "species_key", "prior_value")
+  missing_prior <- setdiff(required_prior, names(values))
+  if (length(missing_prior) > 0L) {
     stop(
       "prior_species_values is missing: ",
-      paste(missing, collapse = ", "),
+      paste(missing_prior, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  required_likelihood <- c("pecan_trait", "species_key", "target_value")
+  missing_likelihood <- setdiff(required_likelihood, names(likelihood))
+  if (length(missing_likelihood) > 0L) {
+    stop(
+      "likelihood_observations is missing: ",
+      paste(missing_likelihood, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  if (
+    length(pecan_consistency_tail) != 1L ||
+    !is.finite(pecan_consistency_tail) ||
+    pecan_consistency_tail < 0.025 ||
+    pecan_consistency_tail >= 0.5
+  ) {
+    stop(
+      "pecan_consistency_tail must be in [0.025, 0.5).",
       call. = FALSE
     )
   }
 
+  values[, pecan_trait := trimws(as.character(pecan_trait))]
+  values[, species_key := trimws(as.character(species_key))]
+  values[, prior_value := suppressWarnings(as.numeric(prior_value))]
+  likelihood[, pecan_trait := trimws(as.character(pecan_trait))]
+  likelihood[, species_key := trimws(as.character(species_key))]
+  likelihood[, target_value := suppressWarnings(as.numeric(target_value))]
+
   targets <- sort(unique(trimws(as.character(targets))))
-  missing_targets <- setdiff(targets, unique(values$pecan_trait))
-  if (length(missing_targets) > 0L) {
+  missing_prior_targets <- setdiff(targets, unique(values$pecan_trait))
+  if (length(missing_prior_targets) > 0L) {
     stop(
       "No species-level prior values for: ",
-      paste(missing_targets, collapse = ", "),
+      paste(missing_prior_targets, collapse = ", "),
       call. = FALSE
     )
   }
+  missing_likelihood_targets <- setdiff(
+    targets,
+    unique(likelihood$pecan_trait)
+  )
+  if (length(missing_likelihood_targets) > 0L) {
+    stop(
+      "No likelihood observations for prior preflight: ",
+      paste(missing_likelihood_targets, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
   prior_trait.data <- lapply(targets, function(trait_i) {
     data.frame(
-      mean = values[pecan_trait == trait_i, as.numeric(prior_value)],
+      mean = values[
+        pecan_trait == trait_i & is.finite(prior_value),
+        as.numeric(prior_value)
+      ],
       stringsAsFactors = FALSE
     )
   })
   names(prior_trait.data) <- targets
+  empty_prior_targets <- targets[
+    vapply(prior_trait.data, nrow, integer(1)) == 0L
+  ]
+  if (length(empty_prior_targets) > 0L) {
+    stop(
+      "No finite species-level prior values for: ",
+      paste(empty_prior_targets, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
   max_prior_species <- max(
     vapply(prior_trait.data, nrow, integer(1))
   )
@@ -1955,14 +2046,403 @@ make_prema_species_prior_distns <- function(
     positive_distribution = "lnorm",
     domain_action = "stop"
   )
+
+  base_parameter_audit <- data.table::copy(data.table::as.data.table(
+    attr(prior.distns, "prior_parameter_audit")
+  ))
+  target_tail <- min(
+    0.499,
+    as.numeric(pecan_consistency_tail) + 1e-4
+  )
+  z_limit <- stats::qnorm(1 - target_tail)
+  preflight_rows <- vector("list", length(targets))
+
+  for (trait_index in seq_along(targets)) {
+    trait_i <- targets[[trait_index]]
+    prior_values_i <- values[
+      pecan_trait == trait_i & is.finite(prior_value),
+      prior_value
+    ]
+    likelihood_i <- likelihood[
+      pecan_trait == trait_i & is.finite(target_value),
+      target_value
+    ]
+    if (length(likelihood_i) == 0L) {
+      stop(
+        "No finite likelihood observations for ", trait_i, ".",
+        call. = FALSE
+      )
+    }
+
+    rule <- prior_registry[trait == trait_i][1L]
+    likelihood_median <- stats::median(likelihood_i)
+    likelihood_min <- min(likelihood_i)
+    likelihood_max <- max(likelihood_i)
+    prior_center <- stats::median(prior_values_i)
+    prior_species_sd <- if (length(prior_values_i) >= 2L) {
+      stats::sd(prior_values_i)
+    } else {
+      NA_real_
+    }
+
+    distn <- as.character(prior.distns[trait_i, "distn"])
+    parama_before <- as.numeric(prior.distns[trait_i, "parama"])
+    paramb_before <- as.numeric(prior.distns[trait_i, "paramb"])
+    parama_after <- parama_before
+    paramb_after <- paramb_before
+    empirical_parama <- parama_before
+    empirical_paramb <- paramb_before
+    adjustment_method <- "NONE"
+    beta_strength <- NA_real_
+
+    if (identical(distn, "unif")) {
+      hard_lower <- as.numeric(rule$lower)
+      hard_upper <- as.numeric(rule$upper)
+      if (
+        !is.finite(hard_lower) || !is.finite(hard_upper) ||
+        hard_upper <= hard_lower
+      ) {
+        stop(
+          "Uniform prior needs finite physical bounds for ", trait_i, ".",
+          call. = FALSE
+        )
+      }
+
+      variability_candidates <- c(
+        prior_species_sd,
+        relative_sd_floor * max(abs(prior_center), 1)
+      )
+      variability_candidates <- variability_candidates[
+        is.finite(variability_candidates) & variability_candidates > 0
+      ]
+      empirical_half_width <- width_multiplier * if (
+        length(variability_candidates) > 0L
+      ) {
+        max(variability_candidates)
+      } else {
+        max((hard_upper - hard_lower) * 0.05, 1)
+      }
+      parama_after <- max(hard_lower, prior_center - empirical_half_width)
+      paramb_after <- min(hard_upper, prior_center + empirical_half_width)
+      if (
+        !is.finite(parama_after) || !is.finite(paramb_after) ||
+        paramb_after <= parama_after
+      ) {
+        stop(
+          "Could not construct a non-degenerate bounded prior for ",
+          trait_i,
+          call. = FALSE
+        )
+      }
+      empirical_parama <- parama_after
+      empirical_paramb <- paramb_after
+      adjustment_method <- "SPECIES_CENTERED_BOUNDED_UNIFORM"
+
+      cdf_i <- .prema_prior_cdf(
+        likelihood_median,
+        distn,
+        parama_after,
+        paramb_after
+      )
+      if (!is.finite(cdf_i) || cdf_i < target_tail) {
+        required_lower <- (
+          likelihood_median - target_tail * paramb_after
+        ) / (1 - target_tail)
+        parama_after <- max(
+          hard_lower,
+          min(parama_after, required_lower)
+        )
+      }
+      cdf_i <- .prema_prior_cdf(
+        likelihood_median,
+        distn,
+        parama_after,
+        paramb_after
+      )
+      if (!is.finite(cdf_i) || cdf_i > 1 - target_tail) {
+        required_upper <- (
+          likelihood_median - target_tail * parama_after
+        ) / (1 - target_tail)
+        paramb_after <- min(
+          hard_upper,
+          max(paramb_after, required_upper)
+        )
+      }
+      if (
+        !isTRUE(all.equal(parama_after, empirical_parama)) ||
+        !isTRUE(all.equal(paramb_after, empirical_paramb))
+      ) {
+        adjustment_method <- paste0(
+          adjustment_method,
+          "+EXPANDED_FOR_LIKELIHOOD_MEDIAN"
+        )
+      }
+    } else if (identical(distn, "beta")) {
+      beta_values <- pmin(
+        1 - 1e-6,
+        pmax(1e-6, prior_values_i)
+      )
+      beta_mean <- mean(beta_values)
+      beta_variance <- if (length(beta_values) >= 2L) {
+        stats::var(beta_values)
+      } else {
+        NA_real_
+      }
+      moment_strength <- if (
+        is.finite(beta_variance) && beta_variance > 0
+      ) {
+        beta_mean * (1 - beta_mean) / beta_variance - 1
+      } else {
+        NA_real_
+      }
+      beta_strength <- if (
+        is.finite(moment_strength) && moment_strength > 0
+      ) {
+        min(50, max(0.10, moment_strength))
+      } else {
+        2
+      }
+
+      make_beta_parameters <- function(strength) {
+        c(
+          parama = max(1e-6, beta_mean * strength),
+          paramb = max(1e-6, (1 - beta_mean) * strength)
+        )
+      }
+      beta_parameters <- make_beta_parameters(beta_strength)
+      parama_after <- beta_parameters[["parama"]]
+      paramb_after <- beta_parameters[["paramb"]]
+      empirical_parama <- parama_after
+      empirical_paramb <- paramb_after
+      adjustment_method <- "SPECIES_PARAMETERIZED_BETA"
+
+      cdf_i <- .prema_prior_cdf(
+        likelihood_median,
+        distn,
+        parama_after,
+        paramb_after
+      )
+      while (
+        is.finite(cdf_i) &&
+        (cdf_i < target_tail || cdf_i > 1 - target_tail) &&
+        beta_strength > 1e-4
+      ) {
+        beta_strength <- beta_strength / 2
+        beta_parameters <- make_beta_parameters(beta_strength)
+        parama_after <- beta_parameters[["parama"]]
+        paramb_after <- beta_parameters[["paramb"]]
+        cdf_i <- .prema_prior_cdf(
+          likelihood_median,
+          distn,
+          parama_after,
+          paramb_after
+        )
+      }
+
+      if (
+        !is.finite(cdf_i) ||
+        cdf_i < target_tail ||
+        cdf_i > 1 - target_tail
+      ) {
+        # A nearly non-informative symmetric beta is the bounded safety
+        # fallback. A tiny species-centered component preserves deterministic
+        # dependence on the selected prior-species values.
+        safety_shapes <- c(1, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
+        resolved_shape <- FALSE
+        for (shape_i in safety_shapes) {
+          parama_candidate <- shape_i + beta_mean * 1e-6
+          paramb_candidate <- shape_i + (1 - beta_mean) * 1e-6
+          cdf_candidate <- .prema_prior_cdf(
+            likelihood_median,
+            distn,
+            parama_candidate,
+            paramb_candidate
+          )
+          if (
+            is.finite(cdf_candidate) &&
+            cdf_candidate >= target_tail &&
+            cdf_candidate <= 1 - target_tail
+          ) {
+            parama_after <- parama_candidate
+            paramb_after <- paramb_candidate
+            cdf_i <- cdf_candidate
+            beta_strength <- 1e-6
+            resolved_shape <- TRUE
+            break
+          }
+        }
+        if (resolved_shape) {
+          adjustment_method <- paste0(
+            adjustment_method,
+            "+BOUNDED_WEAK_SAFETY_FALLBACK"
+          )
+        }
+      } else if (
+        !isTRUE(all.equal(parama_after, empirical_parama)) ||
+        !isTRUE(all.equal(paramb_after, empirical_paramb))
+      ) {
+        adjustment_method <- paste0(
+          adjustment_method,
+          "+LOWER_CONCENTRATION_FOR_LIKELIHOOD_MEDIAN"
+        )
+      }
+    } else if (identical(distn, "lnorm")) {
+      if (!is.finite(likelihood_median) || likelihood_median <= 0) {
+        stop(
+          "Positive lognormal target ", trait_i,
+          " has a non-positive likelihood median; cannot satisfy ",
+          "PEcAn prior consistency without changing its physical domain.",
+          call. = FALSE
+        )
+      }
+      required_sdlog <- abs(
+        log(likelihood_median) - parama_after
+      ) / z_limit
+      if (
+        is.finite(required_sdlog) &&
+        required_sdlog > paramb_after
+      ) {
+        paramb_after <- required_sdlog * 1.01
+        adjustment_method <- "WIDEN_SDLOG_FOR_LIKELIHOOD_MEDIAN"
+      }
+    } else if (identical(distn, "norm")) {
+      required_sd <- abs(
+        likelihood_median - parama_after
+      ) / z_limit
+      if (is.finite(required_sd) && required_sd > paramb_after) {
+        paramb_after <- required_sd * 1.01
+        adjustment_method <- "WIDEN_SD_FOR_LIKELIHOOD_MEDIAN"
+      }
+    } else {
+      stop(
+        "No prior preflight widening rule for distribution ",
+        distn, " (", trait_i, ").",
+        call. = FALSE
+      )
+    }
+
+    cdf_before <- .prema_prior_cdf(
+      likelihood_median,
+      distn,
+      parama_before,
+      paramb_before
+    )
+    cdf_after <- .prema_prior_cdf(
+      likelihood_median,
+      distn,
+      parama_after,
+      paramb_after
+    )
+    resolved <- (
+      is.finite(cdf_after) &&
+      cdf_after >= pecan_consistency_tail &&
+      cdf_after <= 1 - pecan_consistency_tail
+    )
+    if (!resolved) {
+      stop(
+        "Prior preflight could not make ", trait_i,
+        " compatible with its likelihood median while preserving domain. ",
+        "Likelihood median=", signif(likelihood_median, 8),
+        "; distribution=", distn,
+        "; final CDF=", signif(cdf_after, 8),
+        ". Check prior_species_values and target domain.",
+        call. = FALSE
+      )
+    }
+
+    prior.distns[trait_i, "parama"] <- as.numeric(parama_after)
+    prior.distns[trait_i, "paramb"] <- as.numeric(paramb_after)
+    preflight_rows[[trait_index]] <- data.table::data.table(
+      trait = trait_i,
+      n_prior_species = data.table::uniqueN(
+        values[pecan_trait == trait_i, species_key]
+      ),
+      selected_prior_species = paste(
+        sort(unique(values[pecan_trait == trait_i, species_key])),
+        collapse = " | "
+      ),
+      n_likelihood_species = data.table::uniqueN(
+        likelihood[pecan_trait == trait_i, species_key]
+      ),
+      n_prior_likelihood_species_overlap = length(intersect(
+        unique(values[pecan_trait == trait_i, species_key]),
+        unique(likelihood[pecan_trait == trait_i, species_key])
+      )),
+      prior_likelihood_species_overlap = all(
+        unique(values[pecan_trait == trait_i, species_key]) %in%
+          unique(likelihood[pecan_trait == trait_i, species_key])
+      ),
+      n_likelihood_rows = length(likelihood_i),
+      prior_species_center = prior_center,
+      prior_species_sd = prior_species_sd,
+      likelihood_min = likelihood_min,
+      likelihood_median = likelihood_median,
+      likelihood_max = likelihood_max,
+      distn = distn,
+      parama_before_preflight = parama_before,
+      paramb_before_preflight = paramb_before,
+      empirical_parama = empirical_parama,
+      empirical_paramb = empirical_paramb,
+      parama_after_preflight = as.numeric(parama_after),
+      paramb_after_preflight = as.numeric(paramb_after),
+      likelihood_median_cdf_before = cdf_before,
+      likelihood_median_cdf_after = cdf_after,
+      pecan_error_tail = 5e-4,
+      pecan_warning_tail = 0.025,
+      pecan_consistency_tail = as.numeric(pecan_consistency_tail),
+      adjusted_for_likelihood = (
+        !isTRUE(all.equal(parama_after, empirical_parama)) ||
+        !isTRUE(all.equal(paramb_after, empirical_paramb))
+      ),
+      adjustment_method = adjustment_method,
+      beta_final_strength = beta_strength,
+      pecan_preflight_resolved = resolved
+    )
+  }
+
+  preflight_audit <- data.table::rbindlist(
+    preflight_rows,
+    use.names = TRUE,
+    fill = TRUE
+  )
+  prior_parameter_audit <- merge(
+    base_parameter_audit,
+    preflight_audit,
+    by = "trait",
+    all = TRUE,
+    sort = FALSE
+  )
+  prior_parameter_audit[, target_order__ := match(trait, targets)]
+  data.table::setorder(prior_parameter_audit, target_order__)
+  prior_parameter_audit[, target_order__ := NULL]
+
+  prior_configuration <- attr(
+    prior.distns,
+    "prior_sampling_configuration"
+  )
+  prior_configuration$species_summary <- "one median per selected species"
+  prior_configuration$pecan_consistency_tail <-
+    as.numeric(pecan_consistency_tail)
+  prior_configuration$preflight_point <- "likelihood median"
+  prior_configuration$preflight_rule <-
+    "same CDF rule used by PEcAn.MA::meta_analysis_standalone"
+  prior_configuration$bounded_prior_support_preserved <- TRUE
+
   attr(prior.distns, "prior_species_values") <- values[]
   attr(prior.distns, "prior_basis") <-
-    "one median per selected species"
+    "one median per selected species; width preflighted on likelihood median"
+  attr(prior.distns, "prior_parameter_audit") <-
+    prior_parameter_audit[]
+  attr(prior.distns, "prior_compatibility_audit") <-
+    preflight_audit[]
+  attr(prior.distns, "prior_sampling_configuration") <-
+    prior_configuration
 
   list(
     prior.distns = prior.distns,
     prior_registry = prior_registry,
-    prior_trait.data = prior_trait.data
+    prior_trait.data = prior_trait.data,
+    prior_compatibility_audit = preflight_audit[]
   )
 }
 
@@ -2742,6 +3222,12 @@ run_prema_pecan_trait_ma <- function(
     excluded_ambiguous_rows,
     file.path(canonical_dir, "excluded_ambiguous_rows.csv")
   )
+  if (identical(pft_assignment_mode, "pft_range_species")) {
+    data.table::fwrite(
+      excluded_ambiguous_rows,
+      file.path(canonical_dir, "excluded_outside_range_rows.csv")
+    )
+  }
   data.table::fwrite(
     observation_pft_assignment_audit,
     file.path(canonical_dir, "observation_pft_assignment_audit.csv")
@@ -2843,6 +3329,7 @@ run_prema_pecan_trait_ma <- function(
   ma_traits <- names(trait.data)
   prior_bundle <- make_prema_species_prior_distns(
     prior_species_values = prior_split$prior_species_values,
+    likelihood_observations = prior_split$likelihood_observations,
     targets = ma_traits,
     writer_contract = target_result$writer_contract,
     unit_map = unit_map,
@@ -2870,6 +3357,10 @@ run_prema_pecan_trait_ma <- function(
   data.table::fwrite(
     attr(prior.distns, "prior_parameter_audit"),
     file.path(target_dir, "prior_parameter_audit.csv")
+  )
+  data.table::fwrite(
+    prior_bundle$prior_compatibility_audit,
+    file.path(target_dir, "prior_compatibility_audit.csv")
   )
   saveRDS(
     attr(prior.distns, "prior_sampling_configuration"),
@@ -3020,15 +3511,22 @@ run_prema_pecan_trait_ma <- function(
     n_prior_species_used_across_traits = sum(
       prior_split$trait_audit$n_prior_species_used
     ),
-    n_prior_species_held_out_across_traits = sum(
-      prior_split$trait_audit$n_prior_species_held_out
+    n_prior_species_randomly_selected_across_traits = sum(
+      prior_split$trait_audit$n_prior_species_selected_randomly
     ),
-    n_traits_with_species_holdout = prior_split$trait_audit[
-      n_prior_species_held_out > 0L, .N
+    n_prior_species_removed_from_likelihood = sum(
+      prior_split$trait_audit$n_prior_species_removed_from_likelihood
+    ),
+    n_traits_with_random_prior_species_sample = prior_split$trait_audit[
+      n_prior_species_selected_randomly > 0L, .N
     ],
-    n_traits_no_holdout_le2 = prior_split$trait_audit[
-      selection_rule == "ALL_SPECIES_PRIOR_NO_HOLDOUT_LE2", .N
+    n_traits_no_random_prior_sample_le2 = prior_split$trait_audit[
+      selection_rule == "ALL_SPECIES_PRIOR_NO_RANDOM_SAMPLE_LE2", .N
     ],
+    n_priors_adjusted_for_likelihood_compatibility =
+      prior_bundle$prior_compatibility_audit[
+        adjusted_for_likelihood == TRUE, .N
+      ],
     n_targets_using_multiple_routes = target_result$target_audit[
       primary_source == "MULTI_ROUTE", .N
     ],
@@ -3128,6 +3626,8 @@ run_prema_pecan_trait_ma <- function(
     prior_species_assignments = prior_split$species_assignments,
     prior_species_values = prior_split$prior_species_values,
     prior_sampling_configuration = prior_split$configuration,
+    prior_compatibility_audit =
+      prior_bundle$prior_compatibility_audit,
     ma_result = ma_result,
     ma_qc = ma_qc,
     site_variability_summary = site_variability_summary,
@@ -3152,10 +3652,14 @@ run_prema_pecan_trait_ma <- function(
     "\nSpecies excluded because known coordinates were outside range: ",
     pipeline_summary$n_excluded_outside_range_species,
     "\nTargets entering random-effect MA: ", length(ma_traits),
-    "\nPrior species held out across target-specific fits: ",
-    pipeline_summary$n_prior_species_held_out_across_traits,
-    "\nTargets with <=2 species and no holdout: ",
-    pipeline_summary$n_traits_no_holdout_le2,
+    "\nPrior species randomly sampled across target-specific fits: ",
+    pipeline_summary$n_prior_species_randomly_selected_across_traits,
+    "\nPrior species removed from likelihood: ",
+    pipeline_summary$n_prior_species_removed_from_likelihood,
+    "\nTargets with <=2 species and no random prior sample: ",
+    pipeline_summary$n_traits_no_random_prior_sample_le2,
+    "\nPriors widened for PEcAn likelihood-median compatibility: ",
+    pipeline_summary$n_priors_adjusted_for_likelihood_compatibility,
     "\nQC policy: ", ma_qc$classification_policy,
     "\nQC PASS: ", length(ma_qc$passed_traits),
     "\nTargets using sd.site in new-site draws: ",
