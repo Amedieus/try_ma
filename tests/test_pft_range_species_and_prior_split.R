@@ -126,7 +126,7 @@ stopifnot(grepl("no usable points", missing_points_error, fixed = TRUE))
 
 
 # ---------------------------------------------------------------------------
-# Per-target prior species split
+# Per-target prior species selection
 # ---------------------------------------------------------------------------
 
 make_target_rows <- function(trait, n_species) {
@@ -169,27 +169,28 @@ prior_split_repeat <- split_prema_prior_species(
   seed = 41L
 )
 
-expected_held_out <- data.table(
+expected_selection <- data.table(
   pecan_trait = names(species_counts),
-  expected = c(0L, 0L, 1L, 1L, 2L, 3L, 10L)
+  expected_prior_species = c(1L, 2L, 1L, 1L, 2L, 3L, 10L),
+  expected_randomly_selected = c(0L, 0L, 1L, 1L, 2L, 3L, 10L)
 )
-heldout_check <- prior_split_test$trait_audit[
-  expected_held_out,
+selection_check <- prior_split_test$trait_audit[
+  expected_selection,
   on = "pecan_trait"
 ]
 
 stopifnot(
-  all(heldout_check$n_prior_species_held_out == heldout_check$expected),
-  prior_split_test$trait_audit[
-    pecan_trait == "trait_n1", n_prior_species_used
-  ] == 1L,
-  prior_split_test$trait_audit[
-    pecan_trait == "trait_n2", n_prior_species_used
-  ] == 2L,
-  all(prior_split_test$trait_audit[
-    pecan_trait %in% c("trait_n1", "trait_n2"),
-    prior_likelihood_species_overlap
-  ]),
+  all(
+    selection_check$n_prior_species_used ==
+      selection_check$expected_prior_species
+  ),
+  all(
+    selection_check$n_prior_species_selected_randomly ==
+      selection_check$expected_randomly_selected
+  ),
+  all(selection_check$n_prior_species_removed_from_likelihood == 0L),
+  all(selection_check$n_prior_species_held_out == 0L),
+  all(selection_check$prior_likelihood_species_overlap),
   identical(
     prior_split_test$species_assignments,
     prior_split_repeat$species_assignments
@@ -197,12 +198,16 @@ stopifnot(
   identical(
     prior_split_test$likelihood_observations$target_observation_id,
     seq_len(nrow(prior_split_test$likelihood_observations))
-  )
+  ),
+  nrow(prior_split_test$likelihood_observations) ==
+    nrow(target_rows_test)
 )
 
-for (trait_i in names(species_counts)[species_counts > 2L]) {
-  held_out_i <- prior_split_test$species_assignments[
-    pecan_trait == trait_i & species_role == "PRIOR_HELD_OUT",
+# Every selected prior species remains in the likelihood.
+for (trait_i in names(species_counts)) {
+  selected_prior_i <- prior_split_test$species_assignments[
+    pecan_trait == trait_i &
+      species_role == "PRIOR_AND_LIKELIHOOD_SELECTED",
     species_key
   ]
   likelihood_i <- unique(
@@ -211,11 +216,11 @@ for (trait_i in names(species_counts)[species_counts > 2L]) {
       species_key
     ]
   )
-  stopifnot(length(intersect(held_out_i, likelihood_i)) == 0L)
+  stopifnot(all(selected_prior_i %in% likelihood_i))
 }
 
 # Every selected prior species contributes all of its source rows, but only
-# one species median contributes to the prior parameter calculation.
+# one species median contributes to prior parameter construction.
 source_medians <- prior_split_test$prior_source_observations[
   ,
   .(expected_prior_value = median(target_value)),
@@ -242,6 +247,7 @@ writer_contract_test <- data.table(
 )
 prior_bundle_test <- make_prema_species_prior_distns(
   prior_species_values = prior_split_test$prior_species_values,
+  likelihood_observations = prior_split_test$likelihood_observations,
   targets = prior_targets,
   writer_contract = writer_contract_test,
   unit_map = data.table(),
@@ -257,7 +263,113 @@ prior_n_test <- prior_n_test[
 ]
 stopifnot(
   all(prior_n_test$prior_n == prior_n_test$n_prior_species_used),
-  all(prior_bundle_test$prior.distns$distn == "lnorm")
+  all(prior_bundle_test$prior.distns$distn == "lnorm"),
+  all(
+    prior_bundle_test$prior_compatibility_audit$
+      pecan_preflight_resolved
+  )
 )
 
-message("PFT-range species and species-prior split tests passed.")
+
+# ---------------------------------------------------------------------------
+# Domain-aware species priors and PEcAn compatibility preflight
+# ---------------------------------------------------------------------------
+
+domain_prior_values <- data.table(
+  pecan_trait = rep(c("SLA", "leafC", "waterRemoveFrac"), each = 2L),
+  species_key = paste0("prior_species_", seq_len(6L)),
+  prior_value = c(10, 12, 40, 42, 0.20, 0.30)
+)
+domain_likelihood <- data.table(
+  pecan_trait = c("SLA", "SLA", "leafC", "leafC",
+                  "waterRemoveFrac", "waterRemoveFrac"),
+  species_key = paste0("likelihood_species_", seq_len(6L)),
+  target_value = c(900, 1100, 44, 46, 0.35, 0.45)
+)
+domain_contract <- data.table(
+  pecan_trait = c("SLA", "leafC", "waterRemoveFrac"),
+  pecan_input_unit = c(
+    "m2 leaf kg-1 leaf dry mass",
+    "percent leaf dry mass",
+    "day-1"
+  )
+)
+domain_bundle <- make_prema_species_prior_distns(
+  prior_species_values = domain_prior_values,
+  likelihood_observations = domain_likelihood,
+  targets = domain_contract$pecan_trait,
+  writer_contract = domain_contract,
+  unit_map = data.table(),
+  seed = 99L,
+  width_multiplier = 2,
+  relative_sd_floor = 0.10
+)
+domain_priors <- domain_bundle$prior.distns
+domain_audit <- domain_bundle$prior_compatibility_audit
+
+stopifnot(
+  domain_priors["SLA", "distn"] == "lnorm",
+  domain_priors["leafC", "distn"] == "unif",
+  domain_priors["waterRemoveFrac", "distn"] == "beta",
+  domain_priors["leafC", "parama"] >= 0,
+  domain_priors["leafC", "paramb"] <= 100,
+  domain_priors["leafC", "parama"] < domain_priors["leafC", "paramb"],
+  domain_priors["waterRemoveFrac", "parama"] > 0,
+  domain_priors["waterRemoveFrac", "paramb"] > 0,
+  all(domain_audit$likelihood_median_cdf_after >= 0.025),
+  all(domain_audit$likelihood_median_cdf_after <= 0.975),
+  all(domain_audit$pecan_preflight_resolved),
+  domain_audit[trait == "SLA", adjusted_for_likelihood]
+)
+
+# Selected prior-species values must parameterize bounded and positive priors.
+changed_prior_values <- copy(domain_prior_values)
+changed_prior_values[
+  pecan_trait == "leafC",
+  prior_value := prior_value + 10
+]
+changed_prior_values[
+  pecan_trait == "waterRemoveFrac",
+  prior_value := prior_value + 0.20
+]
+changed_prior_values[
+  pecan_trait == "SLA",
+  prior_value := prior_value * 2
+]
+changed_domain_bundle <- make_prema_species_prior_distns(
+  prior_species_values = changed_prior_values,
+  likelihood_observations = domain_likelihood,
+  targets = domain_contract$pecan_trait,
+  writer_contract = domain_contract,
+  unit_map = data.table(),
+  seed = 99L,
+  width_multiplier = 2,
+  relative_sd_floor = 0.10
+)
+changed_domain_priors <- changed_domain_bundle$prior.distns
+
+stopifnot(
+  !identical(
+    as.numeric(unlist(domain_priors["leafC", c("parama", "paramb")])),
+    as.numeric(unlist(changed_domain_priors[
+      "leafC", c("parama", "paramb")
+    ]))
+  ),
+  !identical(
+    as.numeric(unlist(domain_priors[
+      "waterRemoveFrac", c("parama", "paramb")
+    ])),
+    as.numeric(unlist(changed_domain_priors[
+      "waterRemoveFrac", c("parama", "paramb")
+    ]))
+  ),
+  !identical(
+    as.numeric(unlist(domain_priors["SLA", c("parama", "paramb")])),
+    as.numeric(unlist(changed_domain_priors[
+      "SLA", c("parama", "paramb")
+    ]))
+  )
+)
+
+message("PFT-range species and species-prior selection tests passed.")
+
